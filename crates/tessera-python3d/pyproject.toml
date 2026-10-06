@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tessera3d"
+version = "0.1.4"
+requires-python = ">=3.9"
+description = "UniFFI bindings for Tessera 3D rigid-body physics"
+authors = [{ name = "nop", email = "noplab90@gmail.com" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+
+[project.urls]
+Repository = "https://github.com/MechanicalGirlDev/tessera"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+packages = ["tessera3d"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+tessera3d = ["*.dll", "*.so", "*.dylib"]

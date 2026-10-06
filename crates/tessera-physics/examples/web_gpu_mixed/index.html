@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Tessera WebGPU mixed scene</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 2rem; background: #0a1221; color: #e5edf8; }
+      main { max-width: 960px; margin: auto; }
+      canvas { width: 100%; height: auto; border: 1px solid #344660; border-radius: 12px; }
+      p { line-height: 1.6; }
+      #error { color: #ff9c95; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Tessera WebGPU mixed scene</h1>
+      <p>Sphere, box, and capsule contacts and ball joints are computed on the GPU. The rendering shader reads the rigid-body state buffer directly, and the scene restarts about every 4 seconds.</p>
+      <canvas id="scene" width="960" height="600"></canvas>
+      <p id="error" role="status"></p>
+    </main>
+    <script type="module">
+      import init from "./pkg/web_gpu_mixed.js";
+
+      init().catch((error) => {
+        document.querySelector("#error").textContent = `Failed to start: ${error}`;
+      });
+    </script>
+  </body>
+</html>

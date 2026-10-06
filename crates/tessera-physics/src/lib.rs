@@ -1,0 +1,99 @@
+//! Tessera: vendor-neutral rigid-body contact physics under development.
+//!
+//! The articulated and sphere worlds expose CPU contact integration. With the
+//! `gpu-contact` feature, collision kernels and generalized contact impulses
+//! can run through wgpu. The crate is
+//! independent of a robot model.
+
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![allow(clippy::std_instead_of_alloc)]
+
+pub mod articulated_world;
+pub mod articulation;
+pub mod batch;
+pub mod contact_reference;
+pub mod convex;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_dynamics;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_force;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_ground_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_joint_force;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_joint_limit;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_link_terms;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_mass;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_mass_assembly;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_pose;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_root;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_shape_bounds;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_sleep_freeze;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_spherical;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_spherical_drive;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_state;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_articulated_velocity_bias;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_box_box_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_broad_phase;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_contact_mass_response;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_contact_pipeline;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_contact_solver;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_convex_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_ground_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_kinematic_body;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_lbvh;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_point_query;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_ray_query;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_ball_joint;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_contact_transport;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_shape;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_sphere_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_sphere_solver;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_sphere_world;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_rigid_state;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_scene_dynamics;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_sphere_box_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_sphere_contact;
+pub mod mass_properties;
+pub mod material;
+pub mod mesh;
+pub mod mjcf;
+pub mod point_query;
+pub mod ray_query;
+pub mod sleep;
+pub mod sphere_world;
+pub mod spherical_drive;
+pub mod urdf;

@@ -1,0 +1,64 @@
+[package]
+name = "tessera-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vendor-neutral rigid-body contact solver under development"
+
+[lib]
+name = "tessera_physics"
+path = "src/lib.rs"
+
+[[example]]
+name = "contact_solver_bench"
+required-features = ["gpu-contact"]
+
+[[example]]
+name = "gpu_rigid_spheres"
+required-features = ["gpu-contact"]
+
+[[example]]
+name = "resident_island_bench"
+required-features = ["gpu-contact"]
+
+[[example]]
+name = "gpu_rigid_sphere_batch"
+required-features = ["gpu-contact"]
+
+[[example]]
+name = "gpu_scene_query_bench"
+required-features = ["gpu-contact"]
+
+[[example]]
+name = "web_gpu_spheres"
+required-features = ["gpu-contact"]
+
+[[example]]
+name = "web_gpu_mixed"
+required-features = ["gpu-contact"]
+
+[dependencies]
+nalgebra = { workspace = true }
+quick-xml = "0.36"
+thiserror = { workspace = true }
+urdf-rs = { workspace = true }
+wgpu = { version = "28", default-features = false, features = ["std", "wgsl", "dx12", "metal", "vulkan", "webgpu"], optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+default = []
+gpu-contact = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlCanvasElement", "Window", "console"] }
+
+[lints]
+workspace = true

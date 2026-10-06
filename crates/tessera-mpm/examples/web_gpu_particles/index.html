@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Tessera WebGPU MPM</title>
+  <style>body{font-family:system-ui;background:#101b2b;color:#e8eef8;margin:2rem}main{max-width:720px;margin:auto}canvas{width:100%;height:auto;border:1px solid #40506a}p{line-height:1.6}</style>
+</head>
+<body><main>
+  <h1>Tessera WebGPU MPM</h1>
+  <p>3D fluid particles are computed on the GPU and rendered directly from a GPU snapshot. Each frame advances 8 substeps, and results are checked asynchronously after rendering.</p>
+  <canvas id="scene" width="640" height="640"></canvas>
+  <p id="status" role="status">Loading</p>
+  <p>Reload the page to restore the initial state.</p>
+</main>
+<script type="module">
+import init from './pkg/web_gpu_particles.js';
+
+init().catch(error => {
+  document.querySelector('#status').textContent = `Error: ${error}`;
+  console.error(error);
+});
+</script>
+</body></html>

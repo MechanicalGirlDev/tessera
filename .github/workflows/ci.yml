@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_TEST_THREADS: '2'
+  LP_NUM_THREADS: '2'
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          vulkaninfo --summary
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch
+        run: cargo fetch --locked
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        env:
+          TESSERA_ALLOW_SOFTWARE_ADAPTER: '1'
+        run: cargo test --locked --workspace --all-features
+      - name: Software adapter policy and real compute
+        run: |
+          set -euo pipefail
+          cargo build --locked -p tessera-physics --features gpu-contact --example gpu_rigid_sphere_batch
+          binary=target/debug/examples/gpu_rigid_sphere_batch
+          if env -u TESSERA_ALLOW_SOFTWARE_ADAPTER "$binary" > adapter-default.txt 2>&1; then
+            echo "::error::software adapter was accepted without explicit opt-in"
+            exit 1
+          fi
+          grep -F 'only a software compute adapter was available' adapter-default.txt
+          TESSERA_ALLOW_SOFTWARE_ADAPTER=1 "$binary" 2>&1 | tee adapter-compute.txt
+          grep -E 'adapter: .*device_type: Cpu.*backend: Vulkan' adapter-compute.txt

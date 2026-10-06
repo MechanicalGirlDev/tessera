@@ -1,0 +1,45 @@
+[package]
+name = "tessera-mpm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vendor-neutral 3D Material Point Method simulation for Tessera"
+
+[lib]
+name = "tessera_mpm"
+path = "src/lib.rs"
+
+[dependencies]
+nalgebra = { workspace = true }
+thiserror = { workspace = true }
+wgpu = { version = "28", default-features = false, features = ["std", "wgsl", "dx12", "metal", "vulkan", "webgpu"], optional = true }
+futures-channel = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+tessera-physics = { path = "../tessera-physics", optional = true }
+
+[features]
+default = []
+gpu-mpm = ["dep:wgpu", "dep:bytemuck", "dep:futures-channel"]
+rigid-coupling = ["dep:tessera-physics"]
+gpu-rigid-coupling = ["rigid-coupling", "gpu-mpm", "tessera-physics/gpu-contact"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "gpu_particle_render"
+required-features = ["gpu-mpm"]
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlCanvasElement", "Window", "console"] }
+
+[[example]]
+name = "web_gpu_particles"
+required-features = ["gpu-mpm"]

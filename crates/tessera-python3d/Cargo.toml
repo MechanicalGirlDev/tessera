@@ -1,0 +1,27 @@
+[package]
+name = "tessera-python3d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UniFFI bindings for Tessera 3D physics"
+
+[lib]
+name = "tessera3d"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uniffi = { version = "0.32.0", features = ["cli"] }
+thiserror = { workspace = true }
+nalgebra = { workspace = true }
+tessera-physics = { path = "../tessera-physics", features = ["gpu-contact"] }
+tessera-mpm = { path = "../tessera-mpm", features = ["gpu-rigid-coupling"] }
+wgpu = { version = "28", default-features = false, features = ["std", "wgsl", "dx12", "metal", "vulkan", "webgpu"] }
+
+[[bin]]
+name = "tessera-uniffi-bindgen"
+path = "src/bin/bindgen.rs"
+
+[lints]
+workspace = true

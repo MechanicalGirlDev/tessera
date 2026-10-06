@@ -1,0 +1,4 @@
+/target/
+/.omo/
+**/__pycache__/
+**/.venv/
