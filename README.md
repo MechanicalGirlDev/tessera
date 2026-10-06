@@ -1,8 +1,6 @@
 # Tessera
 
-Vendor-neutral 3D rigid-body and Material Point Method physics, extracted from
-[HumanoidSystem](https://github.com/MechanicalGirlDev/humanoid-system).
-Tessera has no HumanoidSystem, robot configuration, or Reiny dependency.
+Vendor-neutral 3D rigid-body and Material Point Method physics.
 
 ## Crates
 
