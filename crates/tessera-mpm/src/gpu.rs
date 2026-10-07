@@ -1199,6 +1199,25 @@ impl GpuMpmTransfers {
                             Matrix3::zeros(),
                         )
                     }
+                    MaterialModel::SandNeoHookean {
+                        young_modulus,
+                        poisson_ratio,
+                        friction_angle,
+                        cohesion,
+                    } => {
+                        let (lambda, mu) = gpu_lame(young_modulus, poisson_ratio)?;
+                        (
+                            [6.0, lambda, mu, 0.0],
+                            [
+                                finite_f32(particle.plastic.plastic_det)?,
+                                finite_f32(particle.plastic.hardening)?,
+                                finite_f32(particle.plastic.log_volume_gain)?,
+                                finite_f32(friction_angle)?,
+                            ],
+                            [finite_f32(cohesion)?, 0.0, 0.0, 0.0],
+                            Matrix3::zeros(),
+                        )
+                    }
                     MaterialModel::Snow {
                         young_modulus,
                         poisson_ratio,
@@ -2273,7 +2292,9 @@ impl MpmWorld {
                 particle.plastic = transfer.plastic();
             } else if matches!(
                 particle.material,
-                MaterialModel::Sand { .. } | MaterialModel::Snow { .. }
+                MaterialModel::Sand { .. }
+                    | MaterialModel::SandNeoHookean { .. }
+                    | MaterialModel::Snow { .. }
             ) {
                 (particle.deformation, particle.plastic) = particle
                     .material
@@ -2293,6 +2314,116 @@ mod tests {
     use super::*;
     use crate::{BoxEmitter, MaterialModel, MeshEmitter, WorldBounds};
     use nalgebra::UnitQuaternion;
+
+    #[tokio::test]
+    async fn sand_neo_hookean_gpu_matches_cpu_direct_and_resident() {
+        #[cfg(target_os = "windows")]
+        let backends = [wgpu::Backends::VULKAN, wgpu::Backends::DX12];
+        #[cfg(not(target_os = "windows"))]
+        let backends = [wgpu::Backends::PRIMARY];
+        for backend in backends {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: backend,
+                ..Default::default()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .expect("SandNeoHookean parity requires a real WebGPU adapter");
+            eprintln!("SandNeoHookean adapter: {:?}", adapter.get_info());
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let rotation = UnitQuaternion::from_euler_angles(0.2, -0.4, 0.7)
+                .to_rotation_matrix()
+                .into_inner();
+            let deformations = [
+                Matrix3::identity(),
+                rotation,
+                Matrix3::identity() * 1.1,
+                Matrix3::from_diagonal(&Vector3::new(0.8, 0.79, 0.81)),
+                rotation
+                    * Matrix3::from_diagonal(&Vector3::new(
+                        0.15f64.exp(),
+                        (-0.25f64).exp(),
+                        (-0.1f64).exp(),
+                    )),
+            ];
+            let particles = deformations
+                .into_iter()
+                .enumerate()
+                .map(|(index, deformation)| {
+                    let mut particle = MpmParticle::new(
+                        Vector3::new(
+                            0.5 + f64::from(u32::try_from(index).unwrap()) * 0.4,
+                            0.5,
+                            0.5,
+                        ),
+                        0.04,
+                        1_000.0,
+                        MaterialModel::sand_neo_hookean(4_000.0, 0.2, 35.0f64.to_radians(), 0.02),
+                    );
+                    particle.deformation = deformation;
+                    particle.plastic.hardening += f64::from(u32::try_from(index).unwrap()) * 0.2;
+                    particle
+                })
+                .collect::<Vec<_>>();
+            let params = MpmParams {
+                gravity: Vector3::zeros(),
+                bounds: Some(WorldBounds {
+                    min: Vector3::zeros(),
+                    max: Vector3::repeat(3.0),
+                }),
+                ..MpmParams::default()
+            };
+            let pipeline = GpuMpmTransfers::new(&device);
+            for resident in [false, true] {
+                let mut cpu = MpmWorld::new(particles.clone(), params.clone()).unwrap();
+                let mut gpu = cpu.clone();
+                for _ in 0..4 {
+                    cpu.step(0.0001).unwrap();
+                }
+                if resident {
+                    gpu.step_gpu_resident_fixed_substeps(&pipeline, &device, &queue, 0.0001, 4)
+                        .unwrap();
+                } else {
+                    for _ in 0..4 {
+                        gpu.step_with_gpu_transfers(&pipeline, &device, &queue, 0.0001)
+                            .unwrap();
+                    }
+                }
+                assert_eq!(cpu.substeps, gpu.substeps);
+                for (index, (expected, actual)) in
+                    cpu.particles.iter().zip(&gpu.particles).enumerate()
+                {
+                    assert!((expected.position - actual.position).norm() < 2e-5);
+                    assert!((expected.velocity - actual.velocity).norm() < 3e-4);
+                    assert!(
+                        (expected.affine - actual.affine).norm() < 2e-3,
+                        "particle={index} resident={resident} affine error={} cpu={:?} gpu={:?} deformation error={} plastic cpu={:?} gpu={:?}",
+                        (expected.affine - actual.affine).norm(),
+                        expected.affine,
+                        actual.affine,
+                        (expected.deformation - actual.deformation).norm(),
+                        expected.plastic,
+                        actual.plastic,
+                    );
+                    assert!((expected.deformation - actual.deformation).norm() < 2e-4);
+                    assert!(
+                        (expected.plastic.plastic_det - actual.plastic.plastic_det).abs() < 2e-4
+                    );
+                    assert!((expected.plastic.hardening - actual.plastic.hardening).abs() < 2e-4);
+                    assert!(
+                        (expected.plastic.log_volume_gain - actual.plastic.log_volume_gain).abs()
+                            < 2e-4
+                    );
+                }
+                assert!(gpu.particles[2].plastic.hardening > particles[2].plastic.hardening);
+                assert!(gpu.particles[4].plastic.hardening > particles[4].plastic.hardening);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn gpu_obstacle_reactions_match_cpu_momentum_transfer() {

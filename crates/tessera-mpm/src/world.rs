@@ -113,7 +113,14 @@ impl MpmParticle {
             rest_volume,
             radius,
             material,
-            plastic: PlasticState::default(),
+            plastic: PlasticState {
+                hardening: if matches!(material, MaterialModel::SandNeoHookean { .. }) {
+                    1.0
+                } else {
+                    0.0
+                },
+                ..PlasticState::default()
+            },
             damping: 0.0,
             group_id: 0,
             transfer_color: 0,
@@ -267,10 +274,11 @@ impl MpmWorld {
             .iter()
             .filter(|particle| particle.enabled && !particle.fixed)
             .map(|particle| {
-                particle.material.timestep_bound(
+                particle.material.timestep_bound_with_deformation(
                     particle.density(),
                     particle.velocity,
                     self.params.cell_width,
+                    particle.deformation.determinant(),
                 )
             })
             .fold(self.params.max_substep, f64::min)

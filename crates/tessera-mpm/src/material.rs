@@ -75,6 +75,18 @@ pub enum MaterialModel {
         /// Exponential compaction-hardening coefficient.
         hardening: f64,
     },
+    /// Neo-Hookean sand with Nexus' hardening Drucker-Prager return mapping.
+    SandNeoHookean {
+        /// Young's modulus in pascals.
+        young_modulus: f64,
+        /// Poisson ratio.
+        poisson_ratio: f64,
+        /// Asymptotic friction angle (`ha`) in radians; Nexus uses 35 degrees.
+        /// The current angle is `ha + (9 degrees * q - 10 degrees) * exp(-0.2 * q)`.
+        friction_angle: f64,
+        /// Tensile yield offset in logarithmic volumetric strain.
+        cohesion: f64,
+    },
 }
 
 impl Default for MaterialModel {
@@ -118,6 +130,22 @@ impl MaterialModel {
         }
     }
 
+    /// Construct Neo-Hookean sand with Nexus' Drucker-Prager hardening law.
+    /// Use a 35-degree friction angle and zero cohesion for Nexus' dry sand defaults.
+    pub fn sand_neo_hookean(
+        young_modulus: f64,
+        poisson_ratio: f64,
+        friction_angle: f64,
+        cohesion: f64,
+    ) -> Self {
+        Self::SandNeoHookean {
+            young_modulus,
+            poisson_ratio,
+            friction_angle,
+            cohesion,
+        }
+    }
+
     /// Construct a weakly compressible fluid.
     pub fn fluid(bulk_modulus: f64, gamma: f64, viscosity: f64) -> Self {
         Self::Fluid {
@@ -151,6 +179,12 @@ impl MaterialModel {
                 poisson_ratio,
             } => valid_elasticity(young_modulus, poisson_ratio),
             Self::Sand {
+                young_modulus,
+                poisson_ratio,
+                friction_angle,
+                cohesion,
+            }
+            | Self::SandNeoHookean {
                 young_modulus,
                 poisson_ratio,
                 friction_angle,
@@ -210,6 +244,11 @@ impl MaterialModel {
             Self::NeoHookean {
                 young_modulus,
                 poisson_ratio,
+            }
+            | Self::SandNeoHookean {
+                young_modulus,
+                poisson_ratio,
+                ..
             } => neo_hookean_stress(deformation, young_modulus, poisson_ratio, 1.0),
             Self::Sand {
                 young_modulus,
@@ -282,13 +321,79 @@ impl MaterialModel {
                 friction_angle,
                 cohesion,
             ),
+            Self::SandNeoHookean {
+                young_modulus,
+                poisson_ratio,
+                friction_angle,
+                cohesion,
+            } => {
+                let (lambda, mu) = lame(young_modulus, poisson_ratio);
+                if lambda == 0.0 {
+                    return (deformation, plastic);
+                }
+                let Some((u, singular, v_t)) = svd_parts(deformation) else {
+                    return (deformation, plastic);
+                };
+                let strain = singular.map(f64::ln) + Vector3::repeat(plastic.log_volume_gain / 3.0);
+                let trace = strain.sum();
+                let deviatoric = strain - Vector3::repeat(trace / 3.0);
+                let norm = deviatoric.norm();
+                let shifted_trace = trace - cohesion;
+                let q = plastic.hardening;
+                let angle = friction_angle
+                    + (9.0f64.to_radians() * q - 10.0f64.to_radians()) * (-0.2 * q).exp();
+                let sine = angle.sin();
+                let alpha = (2.0 / 3.0f64).sqrt() * (2.0 * sine) / (3.0 - sine);
+                // A rotation/isotropic stretch must select the same apex branch
+                // after f32 GPU upload; exact zero is not stable under SVD roundoff.
+                let isotropic = norm <= 4.0 * f64::from(f32::EPSILON);
+                let (projected_log, increment) = if shifted_trace > 0.0 || isotropic {
+                    (Vector3::repeat(cohesion / 3.0), strain.norm())
+                } else {
+                    let gamma =
+                        norm + (3.0 * lambda + 2.0 * mu) / (2.0 * mu) * shifted_trace * alpha;
+                    if gamma <= 0.0 {
+                        return (deformation, plastic);
+                    }
+                    (strain - deviatoric * (gamma / norm), gamma)
+                };
+                let projected = projected_log.map(f64::exp);
+                let old_det = singular.iter().product::<f64>();
+                let new_det = projected.iter().product::<f64>();
+                plastic.plastic_det *= old_det / new_det;
+                plastic.log_volume_gain += old_det.ln() - new_det.ln();
+                plastic.hardening += increment;
+                (u * Matrix3::from_diagonal(&projected) * v_t, plastic)
+            }
             Self::LinearElastic { .. } | Self::NeoHookean { .. } => (deformation, plastic),
         }
     }
 
     /// Conservative CFL timestep bound for one particle.
     pub fn timestep_bound(self, density: f64, velocity: Vector3<f64>, cell_width: f64) -> f64 {
+        self.timestep_bound_with_deformation(density, velocity, cell_width, 1.0)
+    }
+
+    /// CFL bound including elastic volume for Nexus-compatible Neo-Hookean sand.
+    /// Existing materials retain their conservative reference-density bound.
+    pub fn timestep_bound_with_deformation(
+        self,
+        density: f64,
+        velocity: Vector3<f64>,
+        cell_width: f64,
+        deformation_det: f64,
+    ) -> f64 {
         let wave_speed = match self {
+            Self::SandNeoHookean {
+                young_modulus,
+                poisson_ratio,
+                ..
+            } => {
+                let (lambda, mu) = lame(young_modulus, poisson_ratio);
+                let density = density / deformation_det.max(1e-6);
+                let wave_speed = ((lambda + 2.0 * mu) / density).sqrt();
+                return 0.5 * cell_width / wave_speed.max(velocity.norm());
+            }
             Self::Fluid {
                 bulk_modulus,
                 gamma,
@@ -422,6 +527,10 @@ fn svd_parts(matrix: Matrix3<f64>) -> Option<(Matrix3<f64>, Vector3<f64>, Matrix
     let svd = matrix.svd(true, true);
     Some((svd.u?, svd.singular_values, svd.v_t?))
 }
+
+#[cfg(test)]
+#[path = "sand_neo_hookean_tests.rs"]
+mod sand_neo_hookean_tests;
 
 #[cfg(test)]
 mod tests {

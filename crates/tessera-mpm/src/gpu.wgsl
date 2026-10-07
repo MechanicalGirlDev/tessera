@@ -555,6 +555,9 @@ struct PlasticProjection {
 }
 
 fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProjection {
+    if particle.material.x == 6.0 && particle.material.y == 0.0 {
+        return PlasticProjection(deformation, vec4<f32>(particle.material_extra.xyz, 1.0));
+    }
     let axes = principal_axes(deformation);
     let singular = sqrt(max(
         vec3<f32>(axes.matrix[0][0], axes.matrix[1][1], axes.matrix[2][2]),
@@ -586,7 +589,12 @@ fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProje
     let norm = length(deviatoric);
     let cohesion = particle.projection.x;
     let shifted_trace = trace - cohesion;
-    let angle_sine = sin(particle.material_extra.w);
+    var angle = particle.material_extra.w;
+    if particle.material.x == 6.0 {
+        let q = particle.material_extra.y;
+        angle += (0.15707963267948966 * q - 0.17453292519943295) * exp(-0.2 * q);
+    }
+    let angle_sine = sin(angle);
     let alpha = sqrt(2.0 / 3.0) * (2.0 * angle_sine) / (3.0 - angle_sine);
     var plastic = vec3<f32>(
         particle.material_extra.x,
@@ -594,7 +602,13 @@ fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProje
         particle.material_extra.z
     );
     var projected_log = vec3<f32>(cohesion / 3.0);
-    if shifted_trace <= 0.0 && norm > 1e-12 {
+    // Match the CPU model's f32-aware isotropic strain classification.
+    let apex = shifted_trace > 0.0
+        || select(norm <= 1e-12, norm <= 0.000000476837158203125, particle.material.x == 6.0);
+    if apex && particle.material.x == 6.0 {
+        plastic.y += length(strain);
+    }
+    if !apex {
         let lambda = particle.material.y;
         let mu = particle.material.z;
         let gamma = norm + (3.0 * lambda + 2.0 * mu)
@@ -606,9 +620,14 @@ fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProje
         projected_log = strain - deviatoric * (gamma / norm);
     }
     let projected = exp(projected_log);
-    let old_det = max(singular.x * singular.y * singular.z, 1e-12);
-    let new_det = max(projected.x * projected.y * projected.z, 1e-12);
-    plastic.x = clamp(plastic.x * old_det / new_det, 0.01, 100.0);
+    let old_det = select(max(singular.x * singular.y * singular.z, 1e-12),
+        singular.x * singular.y * singular.z, particle.material.x == 6.0);
+    let new_det = select(max(projected.x * projected.y * projected.z, 1e-12),
+        projected.x * projected.y * projected.z, particle.material.x == 6.0);
+    plastic.x *= old_det / new_det;
+    if particle.material.x != 6.0 {
+        plastic.x = clamp(plastic.x, 0.01, 100.0);
+    }
     plastic.z += log(old_det) - log(new_det);
     return PlasticProjection(
         replace_stretches(deformation, axes.vectors, singular, projected),
@@ -628,7 +647,7 @@ fn particle_stress(particle: Particle) -> mat3x3<f32> {
     );
     let j = determinant(deformation);
     var stress = fallback;
-    if particle.material.x == 1.0 {
+    if particle.material.x == 1.0 || particle.material.x == 6.0 {
         let lambda = particle.material.y;
         let mu = particle.material.z;
         let safe_j = max(j, 1e-10);
@@ -909,7 +928,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if particle.material.x == 2.0 {
         let scale = pow(max(determinant(deformation), 1e-9), 1.0 / 3.0);
         deformation = identity * scale;
-    } else if particle.material.x == 4.0 || particle.material.x == 5.0 {
+    } else if particle.material.x == 4.0 || particle.material.x == 5.0 || particle.material.x == 6.0 {
         let projection = project_plastic(deformation, particle);
         deformation = projection.deformation;
         plastic = projection.plastic;
@@ -950,7 +969,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
             || !finite_vec3(affine0) || !finite_vec3(affine1) || !finite_vec3(affine2)
             || !finite_vec3(deformation[0]) || !finite_vec3(deformation[1])
             || !finite_vec3(deformation[2]);
-        if particle.material.x == 4.0 || particle.material.x == 5.0 {
+        if particle.material.x == 4.0 || particle.material.x == 5.0 || particle.material.x == 6.0 {
             resident_failed = resident_failed || plastic.w != 1.0;
         }
         if particle.material.x == 3.0 || particle.material.x == 4.0 || particle.material.x == 5.0 {
@@ -961,16 +980,23 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
         if particle.material.x == 2.0 {
             wave_speed = sqrt(particle.material.y * particle.material.z / density);
         }
-        resident_failed = resident_failed
-            || params.scalars.w * (wave_speed + length(velocity))
-                > 0.4 * params.scalars.x * (1.0 + 1e-4);
+        if particle.material.x == 6.0 {
+            wave_speed *= sqrt(max(determinant(deformation), 1e-6));
+            resident_failed = resident_failed
+                || params.scalars.w * max(wave_speed, length(velocity))
+                    > 0.5 * params.scalars.x * (1.0 + 1e-4);
+        } else {
+            resident_failed = resident_failed
+                || params.scalars.w * (wave_speed + length(velocity))
+                    > 0.4 * params.scalars.x * (1.0 + 1e-4);
+        }
     }
     next_particle.base_cell = vec4<i32>(next_base, i32(resident_failed));
     if plastic.w == 1.0 && particle.material.x == 4.0 {
         next_particle.material_extra.x = plastic.x;
         next_particle.projection.x = plastic.y;
         next_particle.projection.y = plastic.z;
-    } else if plastic.w == 1.0 && particle.material.x == 5.0 {
+    } else if plastic.w == 1.0 && (particle.material.x == 5.0 || particle.material.x == 6.0) {
         next_particle.material_extra.x = plastic.x;
         next_particle.material_extra.y = plastic.y;
         next_particle.material_extra.z = plastic.z;

@@ -97,6 +97,17 @@ pub enum MpmMaterial {
         /// Exponential compaction hardening coefficient.
         hardening: f64,
     },
+    /// Neo-Hookean sand with Nexus' hardening Drucker-Prager plasticity.
+    SandNeoHookean {
+        /// Young's modulus in pascals.
+        young_modulus: f64,
+        /// Poisson ratio.
+        poisson_ratio: f64,
+        /// Asymptotic friction angle in radians; use 35 degrees for Nexus defaults.
+        friction_angle: f64,
+        /// Tensile yield offset in logarithmic volumetric strain.
+        cohesion: f64,
+    },
 }
 
 impl From<MpmMaterial> for MaterialModel {
@@ -150,6 +161,17 @@ impl From<MpmMaterial> for MaterialModel {
                 critical_compression,
                 critical_stretch,
                 hardening,
+            },
+            MpmMaterial::SandNeoHookean {
+                young_modulus,
+                poisson_ratio,
+                friction_angle,
+                cohesion,
+            } => Self::SandNeoHookean {
+                young_modulus,
+                poisson_ratio,
+                friction_angle,
+                cohesion,
             },
         }
     }
@@ -1276,6 +1298,41 @@ impl MpmWorld {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_sand_neo_hookean_preserves_model_parameters_and_plastic_state() {
+        let material = MpmMaterial::SandNeoHookean {
+            young_modulus: 4_000.0,
+            poisson_ratio: 0.2,
+            friction_angle: 35.0f64.to_radians(),
+            cohesion: 0.02,
+        };
+        assert_eq!(
+            MaterialModel::from(material.clone()),
+            MaterialModel::sand_neo_hookean(4_000.0, 0.2, 35.0f64.to_radians(), 0.02)
+        );
+        let mut input = particle(0.5);
+        input.material = material;
+        let world = MpmWorld::new(
+            vec![input.clone()],
+            v(0.0, 0.0, 0.0),
+            0.1,
+            0.001,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(world.particles().unwrap()[0].hardening, 1.0);
+        world.step(0.0001).unwrap();
+        assert_eq!(world.particles().unwrap()[0].hardening, 1.0);
+        input.material = MpmMaterial::SandNeoHookean {
+            young_modulus: -1.0,
+            poisson_ratio: 0.2,
+            friction_angle: 0.5,
+            cohesion: 0.0,
+        };
+        assert!(MpmWorld::new(vec![input], v(0.0, 0.0, 0.0), 0.1, 0.001, None, None).is_err());
+    }
 
     #[test]
     fn closed_mesh_volume_samples_are_available_to_python() {
