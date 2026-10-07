@@ -10,6 +10,24 @@ Vendor-neutral 3D rigid-body and Material Point Method physics.
   optional rigid-body coupling.
 - `tessera-python3d`: UniFFI bindings and a platform-specific `tessera3d` Python wheel.
 
+## Reiny 0.7 integration
+
+All three crates remain independent of Reiny: `tessera-physics` owns rigid-body
+state and solvers, `tessera-mpm` owns particle simulation and coupling, and
+`tessera-python3d` exposes those APIs through UniFFI. Do not add deployment or
+transport dependencies to the solver or Python-binding layers.
+
+A Reiny host adapter owns `main.yaml`, compiled command/state message types,
+named `Cloudy::input`/`output` ports and deployment/module provenance. Initialize
+the world and any required GPU adapter before `Cloudy::ready()`, and propagate
+initialization failures instead of reporting a usable simulation. On
+`Cloudy::shutdown()`, finish the host's work and release its simulation/GPU
+resources. Solver library calls and Python calls are not managed Reiny modules
+by themselves.
+
+The software-GPU opt-in below is for explicit compute validation; Reiny
+integration does not change the application's hardware-adapter policy.
+
 ## Development
 
 Rust 1.97 is pinned, matching the other Reiny ecosystem repositories.
