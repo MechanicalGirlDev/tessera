@@ -87,6 +87,7 @@ pub mod gpu_scene_dynamics;
 pub mod gpu_sphere_box_contact;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_sphere_contact;
+pub mod inverse_kinematics;
 pub mod mass_properties;
 pub mod material;
 pub mod mesh;

@@ -346,6 +346,8 @@ pub struct SceneBody {
     pub inertia: Matrix3<f64>,
     /// Persistent world-frame force at the body origin.
     pub force: Vector3<f64>,
+    /// Persistent world-frame torque about the body origin.
+    pub torque: Vector3<f64>,
     /// Body-attached collision shapes.
     pub colliders: Vec<SceneCollider>,
 }
@@ -501,6 +503,7 @@ impl SceneBody {
             kinematic: false,
             inertia,
             force: Vector3::zeros(),
+            torque: Vector3::zeros(),
             colliders,
         })
     }
@@ -1797,6 +1800,7 @@ impl ArticulatedWorld {
             body.linear_velocity = Vector3::zeros();
             body.angular_velocity = Vector3::zeros();
             body.force = Vector3::zeros();
+            body.torque = Vector3::zeros();
         }
         ResidentSceneConfiguration {
             spheres: self.colliders.clone(),
@@ -2203,7 +2207,12 @@ impl ArticulatedWorld {
             if body.mass == 0.0 {
                 continue;
             }
-            if body.force.iter().any(|v| !v.is_finite()) {
+            if body
+                .force
+                .iter()
+                .chain(body.torque.iter())
+                .any(|v| !v.is_finite())
+            {
                 return Err(ArticulatedWorldError::InvalidInput);
             }
             slots.push(slot);
@@ -2286,6 +2295,7 @@ impl ArticulatedWorld {
         }
         for (&slot, layout) in slots.iter().zip(&scene.bodies) {
             loads[layout.link].force = self.scene_bodies[slot].force;
+            loads[layout.link].torque = self.scene_bodies[slot].torque;
         }
         let mut point_constraints = self.link_point_constraints.clone();
         let mut fixed_constraints = self.link_fixed_constraints.clone();
@@ -3436,7 +3446,6 @@ impl ArticulatedWorld {
             .push(vec![default_material; body.colliders.len()]);
         self.scene_sleep_states.push(SleepState::default());
         self.scene_bodies.push(body);
-        self.clear_contact_cache();
         slot
     }
 
@@ -3470,7 +3479,16 @@ impl ArticulatedWorld {
         if slot < self.scene_sleep_states.len() {
             let _removed = self.scene_sleep_states.remove(slot);
         }
-        self.clear_contact_cache();
+        self.contact_cache.retain_mut(|contact| {
+            for owner in [&mut contact.owners.0, &mut contact.owners.1] {
+                match owner {
+                    ContactOwner::Scene(index) if *index == slot => return false,
+                    ContactOwner::Scene(index) if *index > slot => *index -= 1,
+                    ContactOwner::Ground | ContactOwner::Robot(_) | ContactOwner::Scene(_) => {}
+                }
+            }
+            true
+        });
         true
     }
 
@@ -3551,6 +3569,65 @@ impl ArticulatedWorld {
         body.angular_velocity = angular;
         self.wake_scene_body(index)?;
         Ok(())
+    }
+
+    /// Set persistent world-frame force and torque on a dynamic scene body.
+    ///
+    /// Persistent loads are set independently from generalized robot efforts.
+    pub fn set_scene_body_wrench(
+        &mut self,
+        index: usize,
+        force: Vector3<f64>,
+        torque: Vector3<f64>,
+    ) -> Result<(), ArticulatedWorldError> {
+        if force
+            .iter()
+            .chain(torque.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
+        let body = self
+            .scene_bodies
+            .get_mut(index)
+            .filter(|body| body.mass > 0.0)
+            .ok_or(ArticulatedWorldError::InvalidInput)?;
+        body.force = force;
+        body.torque = torque;
+        self.wake_scene_body(index)
+    }
+
+    /// Apply instantaneous world-frame linear and angular impulses to a dynamic body.
+    ///
+    /// Angular impulse is about the body origin. To apply linear impulse `p` at
+    /// world point `x`, use `(x - body.pose.translation.vector).cross(&p)`.
+    /// The existing contact cache remains valid and the body is woken.
+    pub fn apply_scene_body_impulse(
+        &mut self,
+        index: usize,
+        linear: Vector3<f64>,
+        angular: Vector3<f64>,
+    ) -> Result<(), ArticulatedWorldError> {
+        if linear
+            .iter()
+            .chain(angular.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
+        let body = self
+            .scene_bodies
+            .get(index)
+            .filter(|body| body.mass > 0.0)
+            .ok_or(ArticulatedWorldError::InvalidInput)?;
+        let rotation = body.pose.rotation.to_rotation_matrix();
+        let inertia = rotation.matrix() * body.inertia * rotation.matrix().transpose();
+        let inverse = inertia
+            .try_inverse()
+            .ok_or(ArticulatedWorldError::SingularMass)?;
+        let velocity = body.linear_velocity + linear / body.mass;
+        let spin = body.angular_velocity + inverse * angular;
+        self.set_scene_body_velocity(index, velocity, spin)
     }
 
     /// Whether one dynamic scene body is currently sleeping.
@@ -7220,7 +7297,7 @@ impl ArticulatedWorld {
                         .cross(&(inertia_world * body.angular_velocity));
                     for axis in 0..3 {
                         system.force[slot + axis] = linear_force[axis];
-                        system.force[slot + axis + 3] = -gyroscopic[axis];
+                        system.force[slot + axis + 3] = body.torque[axis] - gyroscopic[axis];
                     }
                 }
                 system
@@ -7273,7 +7350,8 @@ impl ArticulatedWorld {
             let externally_moving = body.linear_velocity.norm()
                 > self.params.sleep.linear_velocity_threshold
                 || body.angular_velocity.norm() > self.params.sleep.angular_velocity_threshold
-                || body.force.norm_squared() > 0.0;
+                || body.force.norm_squared() > 0.0
+                || body.torque.norm_squared() > 0.0;
             if !self.params.sleep.enabled
                 || (self.scene_sleep_states[index].sleeping && externally_moving)
             {
@@ -8552,7 +8630,8 @@ impl ArticulatedWorld {
                 let gyroscopic = body
                     .angular_velocity
                     .cross(&(inertia * body.angular_velocity));
-                let angular = body.angular_velocity - inverse_inertia * gyroscopic * dt;
+                let angular =
+                    body.angular_velocity + inverse_inertia * (body.torque - gyroscopic) * dt;
                 (linear, angular)
             };
             for axis in 0..3 {
@@ -19250,6 +19329,131 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn scene_impulse_uses_world_inertia_and_wakes_the_body() {
+        // Given: a sleeping anisotropic body rotated relative to world axes.
+        let articulation = Articulation::new(
+            vec![LinkSpec {
+                mass: 0.0,
+                center_of_mass: Vector3::zeros(),
+                inertia: Matrix3::zeros(),
+            }],
+            vec![],
+            0,
+        )
+        .unwrap();
+        let mut world = ArticulatedWorld::new(
+            articulation,
+            Isometry3::identity(),
+            vec![],
+            ArticulatedWorldParams::default(),
+        )
+        .unwrap();
+        let mut body = scene_sphere(3.0, 2.0);
+        body.inertia = Matrix3::from_diagonal(&Vector3::new(1.0, 2.0, 4.0));
+        body.pose.rotation =
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), core::f64::consts::FRAC_PI_2);
+        let slot = world.add_scene_body(body);
+        world.sleep_scene_body(slot).unwrap();
+
+        // When: world-space linear and angular impulses are applied.
+        world
+            .apply_scene_body_impulse(slot, Vector3::y() * 2.0, Vector3::x() * 4.0)
+            .unwrap();
+
+        // Then: rotation affects angular response, but no pose is integrated.
+        assert!((world.scene_bodies[slot].linear_velocity - Vector3::y()).norm() < 1e-12);
+        assert!((world.scene_bodies[slot].angular_velocity - Vector3::x() * 2.0).norm() < 1e-12);
+        assert_eq!(world.scene_body_is_sleeping(slot), Some(false));
+        assert!((world.scene_bodies[slot].pose.translation.z - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scene_wrench_persists_through_substeps_and_rotates_a_body() {
+        // Given: an isotropic body without contacts or gravity.
+        let articulation = Articulation::new(
+            vec![LinkSpec {
+                mass: 0.0,
+                center_of_mass: Vector3::zeros(),
+                inertia: Matrix3::zeros(),
+            }],
+            vec![],
+            0,
+        )
+        .unwrap();
+        let mut world = ArticulatedWorld::new(
+            articulation,
+            Isometry3::identity(),
+            vec![],
+            ArticulatedWorldParams {
+                gravity: [0.0; 3],
+                max_substep: 0.001,
+                ..ArticulatedWorldParams::default()
+            },
+        )
+        .unwrap();
+        let slot = world.add_scene_body(scene_sphere(3.0, 1.0));
+        world
+            .set_scene_body_wrench(slot, Vector3::x() * 2.0, Vector3::z())
+            .unwrap();
+
+        // When: native integration executes two substeps.
+        world.step(0.002, &[]).unwrap();
+
+        // Then: both persistent loads contribute to the complete duration.
+        assert!((world.scene_bodies[slot].linear_velocity.x - 0.004).abs() < 1e-12);
+        assert!((world.scene_bodies[slot].angular_velocity.z - 0.02).abs() < 1e-12);
+        assert!(world.scene_bodies[slot].pose.rotation.scaled_axis().z > 0.0);
+        assert_eq!(world.scene_bodies[slot].force, Vector3::x() * 2.0);
+        assert_eq!(world.scene_bodies[slot].torque, Vector3::z());
+    }
+
+    #[test]
+    fn scene_topology_preserves_unrelated_contact_history() {
+        // Given: a solved ground contact beside an unrelated earlier dense slot.
+        let articulation = Articulation::new(
+            vec![LinkSpec {
+                mass: 0.0,
+                center_of_mass: Vector3::zeros(),
+                inertia: Matrix3::zeros(),
+            }],
+            vec![],
+            0,
+        )
+        .unwrap();
+        let mut world = ArticulatedWorld::new(
+            articulation,
+            Isometry3::identity(),
+            vec![],
+            ArticulatedWorldParams::default(),
+        )
+        .unwrap();
+        let _unrelated = world.add_scene_body(scene_sphere(5.0, 0.0));
+        let _supported = world.add_scene_body(scene_sphere(0.49, 1.0));
+        world.step(0.001, &[]).unwrap();
+        let before = world
+            .contact_cache
+            .iter()
+            .find(|contact| contact.owners.1 == ContactOwner::Scene(1))
+            .unwrap();
+        let impulse = before.impulse_world;
+        let count = world.contact_cache.len();
+        assert!(impulse.norm() > 0.0);
+
+        // When: an unrelated body is inserted and the earlier dense slot removed.
+        let _inserted = world.add_scene_body(scene_sphere(10.0, 0.0));
+        assert!(world.remove_scene_body(0));
+
+        // Then: history follows its surviving owner without a global cold start.
+        assert_eq!(world.contact_cache.len(), count);
+        let after = world
+            .contact_cache
+            .iter()
+            .find(|contact| contact.owners.1 == ContactOwner::Scene(0))
+            .unwrap();
+        assert_eq!(after.impulse_world, impulse);
     }
 
     fn scene_box(z: f64, mass: f64) -> SceneBody {

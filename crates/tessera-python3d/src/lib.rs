@@ -43,6 +43,10 @@ use tessera_physics::gpu_rigid_sphere_world::{
 };
 use tessera_physics::gpu_rigid_state::{GpuRigidBodyForces, GpuRigidBodyState};
 use tessera_physics::gpu_scene_dynamics::{GpuSceneDynamics, GpuSceneDynamicsBatch};
+use tessera_physics::inverse_kinematics::{
+    IkConfig as CoreIkConfig, IkState as CoreIkState, IkTarget as CoreIkTarget,
+    forward_kinematics as core_forward_kinematics, inverse_kinematics as core_inverse_kinematics,
+};
 use tessera_physics::material::{CoefficientCombineRule, ColliderMaterial};
 use tessera_physics::mesh::{HeightFieldGeometry, PolylineGeometry, TriangleMeshGeometry};
 use tessera_physics::mjcf::{
@@ -1267,6 +1271,8 @@ pub struct SceneBodyState {
     pub inertia_tensor: Vec<f64>,
     /// Persistent world-space force at the body origin.
     pub force: Vec3,
+    /// Persistent world-space torque about the body origin.
+    pub torque: Vec3,
     /// Number of attached colliders.
     pub collider_count: u32,
 }
@@ -1703,6 +1709,138 @@ fn isometry_link_pose(pose: Isometry3<f64>) -> LinkPose {
     }
 }
 
+/// Pure kinematic configuration, separate from simulation velocities and caches.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IkState {
+    /// Root world pose.
+    pub root_pose: LinkPose,
+    /// Reduced joint coordinates; explicit spherical slots are workspace.
+    pub positions: Vec<f64>,
+    /// Optional per-edge spherical quaternions, with None on scalar/fixed edges.
+    pub orientations: Option<Vec<Option<Quaternion>>>,
+}
+
+impl IkState {
+    fn native(self) -> Result<CoreIkState, TesseraError> {
+        let orientations = self
+            .orientations
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .map(|orientation| {
+                                link_pose_isometry(LinkPose {
+                                    position: Vec3 {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.0,
+                                    },
+                                    orientation,
+                                })
+                                .map(|pose| pose.rotation)
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, TesseraError>>()
+            })
+            .transpose()?;
+        Ok(CoreIkState {
+            root_pose: link_pose_isometry(self.root_pose)?,
+            positions: self.positions,
+            orientations,
+        })
+    }
+}
+
+impl From<CoreIkState> for IkState {
+    fn from(value: CoreIkState) -> Self {
+        Self {
+            root_pose: isometry_link_pose(value.root_pose),
+            positions: value.positions,
+            orientations: value.orientations.map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| {
+                        value.map(|rotation| {
+                            isometry_link_pose(Isometry3::from_parts(
+                                Translation3::identity(),
+                                rotation,
+                            ))
+                            .orientation
+                        })
+                    })
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// Damped-least-squares iteration and convergence controls.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IkConfig {
+    /// Maximum number of displacement updates.
+    pub max_iterations: u32,
+    /// Positive normal-equation damping.
+    pub damping: f64,
+    /// Constrained position tolerance in metres.
+    pub position_tolerance: f64,
+    /// Constrained rotation tolerance in radians.
+    pub rotation_tolerance: f64,
+    /// Scalar coupling tolerance.
+    pub coupling_tolerance: f64,
+    /// Movable slots; floating world-linear/world-angular slots precede joints.
+    pub dofs: Option<Vec<u32>>,
+}
+
+impl Default for IkConfig {
+    fn default() -> Self {
+        let native = CoreIkConfig::default();
+        Self {
+            max_iterations: native.max_iterations as u32,
+            damping: native.damping,
+            position_tolerance: native.position_tolerance,
+            rotation_tolerance: native.rotation_tolerance,
+            coupling_tolerance: native.coupling_tolerance,
+            dofs: None,
+        }
+    }
+}
+
+/// Defaults matching the Nexus CPU IK contract.
+#[uniffi::export]
+pub fn default_ik_config() -> IkConfig {
+    IkConfig::default()
+}
+
+/// One world-frame link target.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IkTarget {
+    /// Stable link index.
+    pub link: u32,
+    /// Desired local-point world position and link orientation.
+    pub pose: LinkPose,
+    /// Point expressed in the link frame.
+    pub local_point: Vec3,
+    /// Exactly six world linear X/Y/Z then angular X/Y/Z constraint flags.
+    pub constrained_axes: Vec<bool>,
+}
+
+/// Actual IK convergence and final state, including unreachable targets.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IkResult {
+    /// Solved configuration.
+    pub state: IkState,
+    /// Whether pose and scalar coupling tolerances were met.
+    pub converged: bool,
+    /// Number of displacement updates applied.
+    pub iterations: u32,
+    /// Six world-frame errors with disabled components zeroed.
+    pub residual: Vec<f64>,
+    /// Maximum absolute scalar equality error.
+    pub coupling_residual: f64,
+}
+
 fn scene_sphere_body(
     pose: LinkPose,
     radius: f64,
@@ -1878,6 +2016,7 @@ impl From<&CoreSceneBody> for SceneBodyState {
                 .flat_map(|row| (0..3).map(move |column| body.inertia[(row, column)]))
                 .collect(),
             force: body.force.into(),
+            torque: body.torque.into(),
             collider_count: body.colliders.len() as u32,
         }
     }
@@ -2970,6 +3109,32 @@ impl ArticulatedWorld {
         Ok(())
     }
 
+    /// Set persistent world-frame force and torque on a dynamic scene body.
+    pub fn set_scene_body_wrench(
+        &self,
+        body: u32,
+        force: Vec3,
+        torque: Vec3,
+    ) -> Result<(), TesseraError> {
+        locked(&self.inner)?
+            .world
+            .set_scene_body_wrench(body as usize, force.nalgebra(), torque.nalgebra())
+            .map_err(failed)
+    }
+
+    /// Apply world-frame impulses; angular impulse is about the body origin.
+    pub fn apply_scene_body_impulse(
+        &self,
+        body: u32,
+        linear: Vec3,
+        angular: Vec3,
+    ) -> Result<(), TesseraError> {
+        locked(&self.inner)?
+            .world
+            .apply_scene_body_impulse(body as usize, linear.nalgebra(), angular.nalgebra())
+            .map_err(failed)
+    }
+
     /// Remove a scene body and renumber constraints referring to later bodies.
     pub fn remove_scene_body(&self, body: u32) -> Result<bool, TesseraError> {
         Ok(locked(&self.inner)?.world.remove_scene_body(body as usize))
@@ -3174,6 +3339,109 @@ impl ArticulatedWorld {
             .iter()
             .copied()
             .collect())
+    }
+
+    /// Read the current native configuration without changing contacts or GPU state.
+    pub fn kinematics_state(&self) -> Result<IkState, TesseraError> {
+        let inner = locked(&self.inner)?;
+        let world = &inner.world;
+        let orientations = world.gpu_spherical_state().map(|joints| {
+            let prefix = if world.floating { 6 } else { 0 };
+            let mut values = vec![None; world.articulation.link_count() - 1];
+            for joint in joints {
+                for (edge, value) in values.iter_mut().enumerate() {
+                    if world
+                        .articulation
+                        .joint_coordinate_range(edge)
+                        .is_some_and(|range| {
+                            range.len() == 3 && range.start + prefix == joint.velocity_slot
+                        })
+                    {
+                        *value = Some(joint.orientation);
+                        break;
+                    }
+                }
+            }
+            values
+        });
+        Ok(CoreIkState {
+            root_pose: world.root_pose,
+            positions: world.positions.iter().copied().collect(),
+            orientations,
+        }
+        .into())
+    }
+
+    /// Pure CPU forward kinematics at a supplied configuration.
+    pub fn forward_kinematics(&self, state: IkState) -> Result<Vec<LinkPose>, TesseraError> {
+        let state = state.native()?;
+        let inner = locked(&self.inner)?;
+        Ok(core_forward_kinematics(&inner.world.articulation, &state)
+            .map_err(failed)?
+            .links
+            .into_iter()
+            .map(isometry_link_pose)
+            .collect())
+    }
+
+    /// Pure CPU IK with reduced mimic coordinates, limits, and scalar equalities.
+    /// This does not teleport the robot, clear contacts, or change resident state.
+    pub fn inverse_kinematics(
+        &self,
+        initial: IkState,
+        target: IkTarget,
+        config: IkConfig,
+    ) -> Result<IkResult, TesseraError> {
+        let initial = initial.native()?;
+        let target = CoreIkTarget {
+            link: target.link as usize,
+            pose: link_pose_isometry(target.pose)?,
+            local_point: target.local_point.nalgebra(),
+            constrained_axes: target
+                .constrained_axes
+                .try_into()
+                .map_err(|_| failed("IK constrained_axes must contain exactly six flags"))?,
+        };
+        let config = CoreIkConfig {
+            max_iterations: config.max_iterations as usize,
+            damping: config.damping,
+            position_tolerance: config.position_tolerance,
+            rotation_tolerance: config.rotation_tolerance,
+            coupling_tolerance: config.coupling_tolerance,
+            dofs: config
+                .dofs
+                .map(|dofs| dofs.into_iter().map(|slot| slot as usize).collect()),
+        };
+        let inner = locked(&self.inner)?;
+        let world = &inner.world;
+        let couplings = world
+            .joint_couplings()
+            .iter()
+            .map(|coupling| CoreJointPolynomialCoupling {
+                follower: coupling.follower,
+                source: Some(coupling.source),
+                coefficients: [coupling.offset, coupling.multiplier, 0.0, 0.0, 0.0],
+                follower_reference: 0.0,
+                source_reference: 0.0,
+            })
+            .chain(world.joint_polynomial_couplings().iter().copied())
+            .collect::<Vec<_>>();
+        let result = core_inverse_kinematics(
+            &world.articulation,
+            &initial,
+            world.floating,
+            &target,
+            &config,
+            &couplings,
+        )
+        .map_err(failed)?;
+        Ok(IkResult {
+            state: result.state.into(),
+            converged: result.converged,
+            iterations: result.iterations as u32,
+            residual: result.residual.to_vec(),
+            coupling_residual: result.coupling_residual,
+        })
     }
 
     /// Set all generalized positions and discard cached contacts.
@@ -4061,6 +4329,40 @@ impl ArticulatedBatch {
             .ok_or_else(|| failed("scene body index out of range"))?;
         scene.force = force;
         Ok(())
+    }
+
+    /// Set one environment's persistent dynamic-body force and torque.
+    pub fn set_scene_body_wrench(
+        &self,
+        index: u32,
+        body: u32,
+        force: Vec3,
+        torque: Vec3,
+    ) -> Result<(), TesseraError> {
+        let id = self.id(index)?;
+        locked(&self.inner)?
+            .batch
+            .environment_mut(id)
+            .ok_or_else(|| failed("environment index out of range"))?
+            .set_scene_body_wrench(body as usize, force.nalgebra(), torque.nalgebra())
+            .map_err(failed)
+    }
+
+    /// Apply world-frame impulses to one environment's dynamic body.
+    pub fn apply_scene_body_impulse(
+        &self,
+        index: u32,
+        body: u32,
+        linear: Vec3,
+        angular: Vec3,
+    ) -> Result<(), TesseraError> {
+        let id = self.id(index)?;
+        locked(&self.inner)?
+            .batch
+            .environment_mut(id)
+            .ok_or_else(|| failed("environment index out of range"))?
+            .apply_scene_body_impulse(body as usize, linear.nalgebra(), angular.nalgebra())
+            .map_err(failed)
     }
 
     /// Remove one environment's scene body and renumber dependent constraints.
@@ -6543,6 +6845,199 @@ mod tests {
 
     fn v(x: f64, y: f64, z: f64) -> Vec3 {
         Vec3 { x, y, z }
+    }
+
+    #[test]
+    fn cpu_scene_wrench_and_impulse_binding_updates_native_state() {
+        // Given: a dynamic scene sphere with known mass and isotropic inertia.
+        let world = ArticulatedWorld::from_urdf(
+            "<robot name=\"root\"><link name=\"base\"/></robot>".into(),
+            false,
+        )
+        .unwrap();
+        let pose = LinkPose {
+            position: v(0.0, 0.0, 10.0),
+            orientation: Quaternion {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            },
+        };
+        let body = world.add_scene_sphere(pose, 0.5, 2.0).unwrap();
+        world
+            .set_scene_body_wrench(body, v(6.0, 0.0, 0.0), v(0.0, 0.0, 0.4))
+            .unwrap();
+
+        // When: impulses and one native substep act on that body.
+        world
+            .apply_scene_body_impulse(body, v(4.0, 0.0, 0.0), v(0.0, 0.0, 0.2))
+            .unwrap();
+        world.step(0.001, vec![]).unwrap();
+
+        // Then: the binding exposes both persistent loads and the correct velocities.
+        let state = world.scene_body_state(body).unwrap();
+        assert!((state.linear_velocity.x - 2.003).abs() < 1e-12);
+        assert!((state.angular_velocity.z - 1.002).abs() < 1e-12);
+        assert!((state.force.x - 6.0).abs() < 1e-12);
+        assert!((state.torque.z - 0.4).abs() < 1e-12);
+        assert!(
+            world
+                .set_scene_body_wrench(body, v(f64::NAN, 0.0, 0.0), v(0.0, 0.0, 0.0))
+                .is_err()
+        );
+        assert!((world.scene_body_state(body).unwrap().force.x - 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cpu_ik_binding_reachable_partial_limits_errors_and_nonmutation() {
+        let xml = r#"<robot name="slider"><link name="base"/><link name="tip">
+          <inertial><mass value="1"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+          </link><joint name="slide" type="prismatic"><parent link="base"/><child link="tip"/>
+          <axis xyz="1 0 0"/><limit lower="-0.5" upper="0.5" effort="10" velocity="10"/></joint></robot>"#;
+        let world = ArticulatedWorld::from_urdf(xml.into(), false).unwrap();
+        world.set_positions(vec![0.1]).unwrap();
+        {
+            let mut inner = locked(&world.inner).unwrap();
+            inner.world.velocities[0] = 0.2;
+            inner.world.contact_forces[1] = Vector3::new(1.0, 2.0, 3.0);
+            inner.world.contact_torques[1] = Vector3::new(4.0, 5.0, 6.0);
+        }
+        let initial = world.kinematics_state().unwrap();
+        let before = world.link_poses().unwrap();
+        let mut target = IkTarget {
+            link: 1,
+            pose: isometry_link_pose(Isometry3::translation(0.3, 0.0, 0.0)),
+            local_point: v(0.0, 0.0, 0.0),
+            constrained_axes: vec![true; 6],
+        };
+        let result = world
+            .inverse_kinematics(initial.clone(), target.clone(), default_ik_config())
+            .unwrap();
+        assert!(result.converged && result.iterations > 0);
+        assert!((result.state.positions[0] - 0.3).abs() < 1e-4);
+        let fk = world.forward_kinematics(result.state).unwrap();
+        assert!((fk[1].position.x - 0.3).abs() < 1e-4);
+        target.pose.position = v(0.4, 7.0, -8.0);
+        target.constrained_axes = vec![true, false, false, false, false, false];
+        let partial = world
+            .inverse_kinematics(initial.clone(), target.clone(), default_ik_config())
+            .unwrap();
+        assert!(partial.converged);
+        assert!((partial.state.positions[0] - 0.4).abs() < 1e-4);
+        assert_eq!(&partial.residual[1..], &[0.0; 5]);
+        target.pose.position.x = 2.0;
+        let unreachable = world
+            .inverse_kinematics(initial.clone(), target.clone(), default_ik_config())
+            .unwrap();
+        assert!(!unreachable.converged);
+        assert_eq!(unreachable.state.positions, [0.5]);
+        assert_eq!(unreachable.iterations, 100);
+        assert!((unreachable.residual[0] - 1.5).abs() < 1e-12);
+        target.link = 2;
+        assert!(
+            world
+                .inverse_kinematics(initial.clone(), target.clone(), default_ik_config())
+                .is_err()
+        );
+        target.link = 1;
+        let mut config = default_ik_config();
+        config.damping = -0.1;
+        assert!(
+            world
+                .inverse_kinematics(initial.clone(), target.clone(), config)
+                .is_err()
+        );
+        target.constrained_axes = vec![true; 5];
+        assert!(
+            world
+                .inverse_kinematics(initial.clone(), target, default_ik_config())
+                .is_err()
+        );
+        let mut invalid = initial.clone();
+        invalid.positions.clear();
+        assert!(world.forward_kinematics(invalid).is_err());
+        assert_eq!(world.positions().unwrap(), initial.positions);
+        assert_eq!(world.velocities().unwrap(), [0.2]);
+        assert_eq!(
+            world.link_poses().unwrap()[1].position.x,
+            before[1].position.x
+        );
+        let wrench = world.link_contact_wrench(1).unwrap();
+        assert_eq!(wrench.force.z, 3.0);
+        assert_eq!(wrench.torque.z, 6.0);
+    }
+
+    #[test]
+    fn cpu_ik_binding_preserves_explicit_spherical_state() {
+        let xml = r#"<mujoco><worldbody><body name="ball">
+          <joint name="ball_joint" type="ball"/><geom type="sphere" size="0.1" mass="1"/>
+          </body></worldbody></mujoco>"#;
+        let world = ArticulatedWorld::from_mjcf(xml.into()).unwrap();
+        {
+            let mut inner = locked(&world.inner).unwrap();
+            inner
+                .world
+                .set_tangent_spherical_state(
+                    &[
+                        tessera_physics::gpu_articulated_spherical::GpuSphericalJointState {
+                            velocity_slot: 0,
+                            orientation: UnitQuaternion::identity(),
+                        },
+                    ],
+                    &nalgebra::DVector::zeros(3),
+                )
+                .unwrap();
+        }
+        let initial = world.kinematics_state().unwrap();
+        assert!(initial.orientations.is_some());
+        let link = world
+            .link_names
+            .iter()
+            .position(|name| name == "ball")
+            .unwrap() as u32;
+        let mut pose = world.forward_kinematics(initial.clone()).unwrap()[link as usize];
+        pose.orientation =
+            isometry_link_pose(Isometry3::rotation(Vector3::new(0.2, -0.3, 0.4))).orientation;
+        let target = IkTarget {
+            link,
+            pose,
+            local_point: v(0.0, 0.0, 0.0),
+            constrained_axes: vec![false, false, false, true, true, true],
+        };
+        let result = world
+            .inverse_kinematics(initial.clone(), target, default_ik_config())
+            .unwrap();
+        assert!(result.converged && result.iterations > 0);
+        assert_eq!(result.state.positions, initial.positions);
+        let solved = world.forward_kinematics(result.state).unwrap()[link as usize];
+        assert!(
+            link_pose_isometry(solved)
+                .unwrap()
+                .rotation
+                .angle_to(&link_pose_isometry(pose).unwrap().rotation,)
+                < 1e-3
+        );
+        let after = world.kinematics_state().unwrap();
+        let before_q = initial
+            .orientations
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .next()
+            .unwrap();
+        let after_q = after
+            .orientations
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .next()
+            .unwrap();
+        assert_eq!(
+            [before_q.x, before_q.y, before_q.z, before_q.w],
+            [after_q.x, after_q.y, after_q.z, after_q.w]
+        );
+        assert_eq!(world.velocities().unwrap(), [0.0; 3]);
     }
 
     #[test]
