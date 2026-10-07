@@ -188,7 +188,9 @@ impl GpuRigidStateSession {
         let forces = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tessera rigid forces"),
             size: force_size.max(size_of::<GpuRigidBodyForces>() as u64),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let frame_forces = device.create_buffer(&wgpu::BufferDescriptor {

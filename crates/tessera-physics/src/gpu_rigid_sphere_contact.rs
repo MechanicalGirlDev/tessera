@@ -975,7 +975,9 @@ impl GpuRigidSphereContacts {
         let sleep_timers = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera resident sphere sleep timers"),
             contents: bytemuck::cast_slice(&vec![GpuSleepState::default(); radii.len().max(1)]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera rigid sphere contact params"),
@@ -2243,6 +2245,11 @@ impl GpuRigidSphereContacts {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((self.body_count as u32).div_ceil(64), 1, 1);
         Ok(())
+    }
+
+    /// Sleep history and its packed stride for native GPU topology transfers.
+    pub(crate) fn sleep_state_buffer(&self) -> (&wgpu::Buffer, u64) {
+        (&self.sleep_timers, size_of::<GpuSleepState>() as u64)
     }
 
     /// Clear one body's idle timer after replacing its state or geometry.

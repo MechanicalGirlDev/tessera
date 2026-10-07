@@ -1110,8 +1110,9 @@ impl GpuRigidSphereWorld {
     /// Append a sphere, returning its dense index.
     ///
     /// Topology edits copy surviving state on the GPU and rebuild contact buffers. Queued
-    /// forces and warm-start impulses are discarded. Surviving joints retain
-    /// their settings and angle history. Use the batch API for grouped worlds.
+    /// forces and warm-start impulses are discarded. Surviving sleep timers,
+    /// joint settings, and angle history are retained. Use the batch API for
+    /// grouped worlds, whose environment edits preserve unrelated queued forces.
     pub fn append_body(
         &mut self,
         state: GpuRigidBodyState,
@@ -1149,8 +1150,8 @@ impl GpuRigidSphereWorld {
     /// Remove a sphere and return its last GPU state.
     ///
     /// All later dense indices shift down by one. Only the removed body is read
-    /// back; surviving state is copied on the GPU. Queued forces, warm-start
-    /// impulses, and sleep timers are discarded. Attached joints are removed;
+    /// back; surviving state and sleep timers are copied on the GPU. Queued forces
+    /// and warm-start impulses are discarded. Attached joints are removed;
     /// surviving joints retain their settings and angle history.
     pub fn remove_body(
         &mut self,
@@ -1201,9 +1202,9 @@ impl GpuRigidSphereWorld {
 
     /// Append a primitive to a single mixed-shape world.
     ///
-    /// This copies surviving state on the GPU and rebuilds contact buffers. Queued forces,
-    /// warm-start impulses, and sleep timers are discarded. Surviving joints
-    /// retain their settings and angle history.
+    /// This copies surviving state and sleep timers on the GPU and rebuilds contact
+    /// buffers. Queued forces and warm-start impulses are discarded. Surviving
+    /// joints retain their settings and angle history.
     pub fn append_primitive(
         &mut self,
         state: GpuRigidBodyState,
@@ -1244,8 +1245,8 @@ impl GpuRigidSphereWorld {
     /// Remove a primitive and return its last GPU state and collision shape.
     ///
     /// Later dense indices shift down by one. Only the removed body is read back;
-    /// surviving state is copied on the GPU. Queued forces, warm-start impulses,
-    /// and sleep timers are discarded. Attached joints are removed; surviving
+    /// surviving state and sleep timers are copied on the GPU. Queued forces and
+    /// warm-start impulses are discarded. Attached joints are removed; surviving
     /// joints retain their settings and angle history.
     pub fn remove_primitive(
         &mut self,
@@ -1468,6 +1469,47 @@ impl GpuRigidSphereWorld {
                         suffix as u64 * bytes_per_body,
                     );
                     copied = true;
+                }
+            }
+        }
+        let (prefix, old_suffix, new_suffix) = match &edit {
+            TopologyEdit::Insert(index, _) => (*index, *index, *index + 1),
+            TopologyEdit::Remove(index) => (*index, *index + 1, *index),
+            TopologyEdit::InsertRange(index, states) => (*index, *index, *index + states.len()),
+            TopologyEdit::RemoveRange(range) => (range.start, range.end, range.start),
+        };
+        let (previous_sleep, sleep_stride) = self.contacts.sleep_state_buffer();
+        let (next_sleep, _) = next.contacts.sleep_state_buffer();
+        // Single-body edits retain their existing force-clearing contract.
+        // Environment edits must not discard another environment's queued loads.
+        let preserve_forces = matches!(
+            &edit,
+            TopologyEdit::InsertRange(..) | TopologyEdit::RemoveRange(..)
+        );
+        for (source, destination, stride, preserve) in [
+            (
+                self.state.force_buffer(),
+                next.state.force_buffer(),
+                size_of::<GpuRigidBodyForces>() as u64,
+                preserve_forces,
+            ),
+            (previous_sleep, next_sleep, sleep_stride, true),
+        ] {
+            if !preserve {
+                continue;
+            }
+            for (old_start, new_start, count) in [
+                (0, 0, prefix),
+                (old_suffix, new_suffix, self.len() - old_suffix),
+            ] {
+                if count > 0 {
+                    encoder.copy_buffer_to_buffer(
+                        source,
+                        old_start as u64 * stride,
+                        destination,
+                        new_start as u64 * stride,
+                        count as u64 * stride,
+                    );
                 }
             }
         }
@@ -2841,8 +2883,8 @@ impl GpuRigidSphereBatch {
 
     /// Append a sphere to one environment and return its local dense index.
     ///
-    /// Surviving body states are copied on the GPU. Topology edits discard
-    /// queued forces, sleep timers, and warm-start impulses for the batch.
+    /// Surviving body states, queued forces, and sleep timers are copied on the GPU.
+    /// Topology edits invalidate contact warm-start impulses for the batch.
     /// Surviving joints retain their settings and angle history.
     pub fn append_body_environment(
         &mut self,
@@ -6570,6 +6612,101 @@ mod tests {
             eprintln!("kinematic batch isolation passed on {backend:?}");
         }
         assert!(tested > 0, "no GPU backend available");
+    }
+
+    #[test]
+    fn topology_edits_preserve_queued_forces_and_sleep_history() {
+        // Given: two isolated environments with queued force and live sleep history.
+        let context = GpuContactDevice::new().expect("topology test requires a GPU adapter");
+        let first = [body(0.0, 0.0)];
+        let second = [body(10.0, 0.0)];
+        let mut batch = GpuRigidSphereBatch::new(
+            context.device(),
+            context.queue(),
+            &[
+                GpuRigidSphereEnvironment {
+                    states: &first,
+                    radii: &[0.1],
+                },
+                GpuRigidSphereEnvironment {
+                    states: &second,
+                    radii: &[0.1],
+                },
+            ],
+            config(),
+        )
+        .unwrap();
+        batch
+            .write_forces(
+                1,
+                0,
+                GpuRigidBodyForces {
+                    force: [2.0, 0.0, 0.0, 0.0],
+                    ..GpuRigidBodyForces::default()
+                },
+            )
+            .unwrap();
+        let (sleep, stride) = batch.world.contacts.sleep_state_buffer();
+        let history = [10.0f32, 0.0, 1.0, 0.125, 0.0, 0.0, 0.0, 0.0];
+        context
+            .queue()
+            .write_buffer(sleep, stride, bytemuck::cast_slice(&history));
+
+        // When: unrelated bodies are inserted and an earlier environment removed.
+        let _inserted = batch
+            .append_environment(&[body(20.0, 0.0)], &[0.1])
+            .unwrap();
+        let _removed = batch.remove_environment(0).unwrap();
+        let (sleep, _) = batch.world.contacts.sleep_state_buffer();
+        let staging = context.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("topology sleep history proof"),
+            size: stride,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(sleep, 0, &staging, 0, stride);
+        let submission = context.queue().submit(Some(encoder.finish()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap();
+            });
+        let _poll = context
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(core::time::Duration::from_secs(10)),
+            })
+            .unwrap();
+        receiver
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let mapped = staging.slice(..).get_mapped_range();
+        let preserved: &[f32] = bytemuck::cast_slice(&mapped);
+        assert_eq!(preserved, &history);
+        drop(mapped);
+        staging.unmap();
+        let _contacts = batch.step(0.01).unwrap();
+
+        // Then: force remains queued for its survivor, not another environment.
+        let retained = batch.readback_environment(0).unwrap()[0];
+        let inserted = batch.readback_environment(1).unwrap()[0];
+        assert!((retained.linear_velocity[0] - 0.02).abs() < 1e-6);
+        assert!(inserted.linear_velocity[0].abs() < 1e-6);
+
+        // A consumed force must not return after another environment rebuild.
+        let _inserted = batch
+            .append_environment(&[body(30.0, 0.0)], &[0.1])
+            .unwrap();
+        let _removed = batch.remove_environment(1).unwrap();
+        let _contacts = batch.step(0.01).unwrap();
+        let retained = batch.readback_environment(0).unwrap()[0];
+        let inserted = batch.readback_environment(1).unwrap()[0];
+        assert!((retained.linear_velocity[0] - 0.02).abs() < 1e-6);
+        assert!(inserted.linear_velocity[0].abs() < 1e-6);
     }
 
     #[test]
@@ -10685,7 +10822,10 @@ mod tests {
         let _pairs = world.step(0.01).unwrap();
         let after_remove = world.readback().unwrap();
         for (index, expected) in [0.02, 20.06, 30.04].into_iter().enumerate() {
-            assert!((after_remove[index].position_inverse_mass[0] - expected).abs() < 1e-4);
+            assert!(
+                (after_remove[index].position_inverse_mass[0] - expected).abs() < 1e-4,
+                "survivor {index}, expected x={expected}, states={after_remove:?}"
+            );
         }
         assert!((after_remove[1].linear_velocity[0] - 3.0).abs() < 1e-4);
     }
