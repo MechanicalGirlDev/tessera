@@ -10,15 +10,17 @@ Vendor-neutral 3D rigid-body and Material Point Method physics.
   optional rigid-body coupling.
 - `tessera-python3d`: UniFFI bindings and a platform-specific `tessera3d` Python wheel.
 
-## Reiny 0.7 integration
+## Reiny 0.8 integration
 
 All three crates remain independent of Reiny: `tessera-physics` owns rigid-body
 state and solvers, `tessera-mpm` owns particle simulation and coupling, and
 `tessera-python3d` exposes those APIs through UniFFI. Do not add deployment or
 transport dependencies to the solver or Python-binding layers.
 
-A Reiny host adapter owns `main.yaml`, compiled command/state message types,
-named `Cloudy::input`/`output` ports and deployment/module provenance. Initialize
+A Reiny host adapter owns its version 2 `main.yaml`, compiled command/state
+message types, named `Cloudy::input`/`output` ports and deployment/module
+provenance. The adapter's app manifest owns endpoint policies; callers supply
+wiring rather than redefining those contracts. Initialize
 the world and any required GPU adapter before `Cloudy::ready()`, and propagate
 initialization failures instead of reporting a usable simulation. On
 `Cloudy::shutdown()`, finish the host's work and release its simulation/GPU
