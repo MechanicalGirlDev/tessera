@@ -2762,6 +2762,7 @@ impl GpuArticulatedBoxContactKind {
 pub struct GpuArticulatedGroundContactBatch {
     device: wgpu::Device,
     pipeline: wgpu::ComputePipeline,
+    solver_policy: wgpu::Buffer,
     systems: wgpu::Buffer,
     spheres: wgpu::Buffer,
     static_sphere_rows: Vec<Vec<(usize, usize)>>,
@@ -2843,6 +2844,73 @@ pub struct GpuArticulatedGroundContactBatch {
 }
 
 impl GpuArticulatedGroundContactBatch {
+    /// Update native penetration recovery and cached-impulse damping.
+    ///
+    /// Validation precedes upload. Queue use must be serialized with stepping.
+    pub fn update_contact_policy(
+        &self,
+        queue: &wgpu::Queue,
+        policy: crate::gpu_contact_policy::GpuContactPolicy,
+    ) -> Result<(), GpuArticulatedGroundContactError> {
+        let values = policy.packed()?;
+        queue.write_buffer(&self.solver_policy, 0, bytemuck::cast_slice(&values));
+        Ok(())
+    }
+
+    /// Create a resident normal-impulse observation for one to four unique links.
+    ///
+    /// Selection is shared across environments. Encode the sensor after a contact
+    /// solve; its output is the last sampled substep, not a sum across steps.
+    pub fn normal_impulse_sensor(
+        &self,
+        links: &[usize],
+    ) -> Result<crate::gpu_contact_sensor::GpuContactImpulseSensor, GpuArticulatedGroundContactError>
+    {
+        if links.is_empty()
+            || links.len() > 4
+            || links.iter().collect::<HashSet<_>>().len() != links.len()
+            || self
+                .link_ranges
+                .iter()
+                .any(|range| links.iter().any(|link| *link >= range.len()))
+        {
+            return Err(GpuArticulatedGroundContactError::InvalidInput);
+        }
+        let word = |value: usize| {
+            u32::try_from(value).map_err(|_| GpuArticulatedGroundContactError::Capacity)
+        };
+        let mut rows = Vec::with_capacity(self.environment_count * links.len());
+        for (environment, (contacts, link_range)) in self
+            .contact_ranges
+            .iter()
+            .zip(&self.link_ranges)
+            .enumerate()
+        {
+            for &link in links {
+                rows.push([
+                    word(contacts.start)?,
+                    word(contacts.len())?,
+                    word(link_range.start + link)?,
+                    word(environment)?,
+                ]);
+            }
+        }
+        crate::gpu_contact_sensor::GpuContactImpulseSensor::new(
+            &self.device,
+            &self.spheres,
+            &self.state_status,
+            &self.mass_status,
+            &rows,
+            [
+                word(size_of::<PackedSphere>() / 4)?,
+                word(offset_of!(PackedSphere, impulses) / 4)?,
+                word(offset_of!(PackedSphere, diagnostic_first_origin) / 4 + 3)?,
+                word(offset_of!(PackedSphere, diagnostic_second_origin) / 4 + 3)?,
+            ],
+            links,
+        )
+    }
+
     /// Bind sphere contacts to fixed-root batches containing every link term.
     pub fn new(
         state: &GpuGeneralizedStateBatch,
@@ -7985,6 +8053,13 @@ impl GpuArticulatedGroundContactBatch {
             device: device.clone(),
             pipeline,
             systems: system_buffer,
+            solver_policy: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tessera resident contact policy"),
+                contents: bytemuck::cast_slice(
+                    &crate::gpu_contact_policy::GpuContactPolicy::default().packed()?,
+                ),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            }),
             prescribed_capsule_rows,
             prescribed_axial_rows,
             spheres: sphere_buffer,
@@ -10979,6 +11054,59 @@ impl GpuArticulatedGroundContactBatch {
         }
     }
 
+    pub(crate) fn encode_clear_environment(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        environment: usize,
+    ) {
+        let dynamic = &self.dynamic_rows[environment];
+        for row in self.contact_ranges[environment].clone() {
+            if dynamic.contains(&row) {
+                encoder.clear_buffer(
+                    &self.spheres,
+                    (row * size_of::<PackedSphere>()) as u64,
+                    Some(size_of::<PackedSphere>() as u64),
+                );
+            } else {
+                encoder.clear_buffer(
+                    &self.spheres,
+                    (row * size_of::<PackedSphere>() + offset_of!(PackedSphere, impulses)) as u64,
+                    Some(32),
+                );
+            }
+        }
+        if let Some(activity) = &self.contact_activity {
+            let links = &self.link_ranges[environment];
+            for buffer in [
+                &activity.wake_requests,
+                &activity.component_wake,
+                &activity.link_wake,
+                &activity.idle_time,
+                &activity.component_idle,
+                &activity.idle_flags,
+                &activity.sleep_candidates,
+                &activity.previous_geometry,
+                &activity.flags,
+            ] {
+                encoder.clear_buffer(buffer, links.start as u64 * 4, Some(links.len() as u64 * 4));
+            }
+            let seeds = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Tessera selected reset mobility seeds"),
+                    contents: bytemuck::cast_slice(&activity.seed_parents[links.clone()]),
+                    usage: wgpu::BufferUsages::COPY_SRC,
+                });
+            encoder.copy_buffer_to_buffer(
+                &seeds,
+                0,
+                &activity.parents,
+                links.start as u64 * 4,
+                seeds.size(),
+            );
+        }
+    }
+
     /// Update reserved joint-friction bounds before the next GPU submission.
     ///
     /// An environment with no friction rows can only keep zero friction.
@@ -11976,6 +12104,7 @@ impl GpuArticulatedGroundContactBatch {
             &self.velocities,
             &self.accelerations,
             &self.state_status,
+            &self.solver_policy,
         ];
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Tessera articulated contact bindings"),

@@ -50,6 +50,10 @@ pub struct GpuArticulatedSphericalDriveBatch {
 }
 
 impl GpuArticulatedSphericalDriveBatch {
+    pub(crate) fn parameter_buffer(&self) -> &wgpu::Buffer {
+        &self.parameters
+    }
+
     /// Bind one optional drive per quaternion in constructor environment/joint order.
     pub fn new(
         state: &GpuGeneralizedStateBatch,
@@ -109,7 +113,9 @@ impl GpuArticulatedSphericalDriveBatch {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Tessera spherical drive parameters"),
                 contents: bytemuck::cast_slice(&packed),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             });
         let shader = state
             .device()

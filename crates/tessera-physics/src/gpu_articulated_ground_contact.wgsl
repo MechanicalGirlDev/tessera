@@ -36,6 +36,13 @@ struct Pose {
 @group(0) @binding(5) var<storage, read> velocities: array<f32>;
 @group(0) @binding(6) var<storage, read_write> accelerations: array<f32>;
 @group(0) @binding(7) var<storage, read_write> state_status: array<atomic<u32>>;
+@group(0) @binding(8) var<uniform> contact_policy: vec4<f32>;
+
+fn contact_recovery_velocity(distance: f32, dt: f32) -> f32 {
+    return min(
+        contact_policy.x * max(-distance - contact_policy.w, 0.0) / dt,
+        contact_policy.y);
+}
 
 fn quat_rotate(q: vec4<f32>, value: vec3<f32>) -> vec3<f32> {
     let doubled = 2.0 * cross(q.xyz, value);
@@ -3019,7 +3026,9 @@ fn resolve_capsule_face_normal_block(system: System, index: u32, second: Sphere,
     let trace = k11 + k22;
     if (!(determinant > 1e-6 * trace * trace) || !(trace < 1e30)) { return second_impulse; }
     var first_target_velocity = -first.diagnostic_first.w / dt;
-    if (first.diagnostic_first.w < 0.0) { first_target_velocity = min(0.2 * -first.diagnostic_first.w / dt, 2.0); }
+    if (first.diagnostic_first.w < 0.0) {
+        first_target_velocity = contact_recovery_velocity(first.diagnostic_first.w, dt);
+    }
     if (first.material.x > 0.0 && first.diagnostic_first.w <= 0.0) {
         first_target_velocity = max(first_target_velocity, -first.material.x * min(incoming, 0.0));
     }
@@ -4178,7 +4187,7 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
                 && dot(sphere.previous_normal.xyz, normal) > 0.999
                 && (distance < 0.0 || distance + dt * normal_velocity < 0.0)
                 && all(abs(previous_impulses) < vec3<f32>(1e30))) {
-                previous_impulses *= 0.8;
+                previous_impulses *= contact_policy.z;
                 apply_cached_impulse(system, sphere, normal, tangent_one, tangent_two,
                     contact_offset, second_offset, previous_impulses);
                 normal_velocity = prescribed_normal;
@@ -4218,7 +4227,7 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
         }
         var target_velocity = -correction_distance / dt;
         if (distance < 0.0) {
-            target_velocity = min(0.2 * -correction_distance / dt, 2.0);
+            target_velocity = contact_recovery_velocity(correction_distance, dt);
         }
         if (sphere.material.x > 0.0 && distance <= 0.0) {
             target_velocity = max(target_velocity,

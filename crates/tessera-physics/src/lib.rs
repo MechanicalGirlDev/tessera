@@ -8,6 +8,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![allow(clippy::std_instead_of_alloc)]
 
+/// Native compute API; its version may differ from an application's renderer.
+#[cfg(feature = "gpu-contact")]
+pub use wgpu;
+
 pub mod articulated_world;
 pub mod articulation;
 pub mod batch;
@@ -54,6 +58,10 @@ pub mod gpu_contact_mass_response;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_contact_pipeline;
 #[cfg(feature = "gpu-contact")]
+pub mod gpu_contact_policy;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_contact_sensor;
+#[cfg(feature = "gpu-contact")]
 pub mod gpu_contact_solver;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_convex_contact;
@@ -63,6 +71,8 @@ pub mod gpu_ground_contact;
 pub mod gpu_kinematic_body;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_lbvh;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_motor_target;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_point_query;
 #[cfg(feature = "gpu-contact")]

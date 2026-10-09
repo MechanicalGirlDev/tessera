@@ -11,6 +11,10 @@ use wgpu::util::DeviceExt;
 use crate::gpu_articulated_mass::{GpuArticulatedMassBatch, GpuArticulatedMassError, read_buffer};
 use crate::gpu_articulated_mass_assembly::GpuArticulatedMassAssemblyBatch;
 
+/// Immutable resident snapshots and selective articulated environment resets.
+#[path = "gpu_articulated_reset.rs"]
+pub mod reset;
+
 /// One packed generalized-coordinate state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuGeneralizedState {

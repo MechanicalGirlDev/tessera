@@ -70,7 +70,14 @@ use crate::gpu_articulated_velocity_bias::{
 };
 use crate::gpu_contact_pipeline::GpuContactDevice;
 use crate::gpu_lbvh::GpuLbvh;
+use crate::gpu_motor_target::{
+    GpuMotorTargetControl, GpuMotorTargetMapping, GpuMotorTargetMode, PackedMotorTargetMapping,
+};
 use crate::spherical_drive::SphericalJointDrive;
+
+#[path = "gpu_dynamics_reset.rs"]
+mod resident_reset;
+pub use resident_reset::GpuArticulatedDynamicsResetTemplates;
 
 #[cfg(test)]
 use crate::gpu_articulated_ground_contact::self_contact_sphere_pairs;
@@ -410,6 +417,8 @@ pub struct GpuArticulatedDynamicsBatch {
     poses: GpuArticulatedPoseBatch,
     link_terms: GpuArticulatedLinkTermsBatch,
     joint_forces: GpuArticulatedJointForceBatch,
+    motor_targets: Option<GpuMotorTargetControl>,
+    scalar_motor_links: Vec<Vec<(usize, usize)>>,
     accepted_joints: std::sync::Mutex<Vec<Vec<GpuJointForceInput>>>,
     joint_limits: GpuArticulatedJointLimitBatch,
     velocity_bias: GpuArticulatedVelocityBiasBatch,
@@ -919,7 +928,7 @@ impl GpuArticulatedDynamicsBatch {
                 &poses,
                 spherical,
             )?
-        } else if floating_roots.iter().any(|&flag| flag) {
+        } else {
             GpuArticulatedVelocityBiasBatch::new_with_floating_roots(
                 &state,
                 &mass,
@@ -927,8 +936,6 @@ impl GpuArticulatedDynamicsBatch {
                 &articulations,
                 &poses,
             )?
-        } else {
-            GpuArticulatedVelocityBiasBatch::new(&state, &mass, &forces, &articulations, &roots)?
         };
         let root_integration = if floating_roots.iter().any(|&flag| flag) {
             Some(GpuArticulatedRootBatch::new(&poses, &state, timestep)?)
@@ -1122,6 +1129,25 @@ impl GpuArticulatedDynamicsBatch {
             .map(|(input, &root_dofs)| input.articulation.coordinate_affected_links(root_dofs != 0))
             .collect();
         let mut batch = Self {
+            motor_targets: None,
+            scalar_motor_links: inputs
+                .iter()
+                .zip(&root_dofs)
+                .map(|(input, &root)| {
+                    let (_, _, joints) = input.articulation.gpu_pose_topology();
+                    joints
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(edge, joint)| {
+                            let range = input.articulation.joint_coordinate_range(edge)?;
+                            (range.len() == 1
+                                && input.articulation.joint_coordinate_scale(edge) == Some(1.0)
+                                && input.articulation.joint_coordinate_offset(edge) == Some(0.0))
+                            .then_some((root + range.start, joint.child))
+                        })
+                        .collect()
+                })
+                .collect(),
             coordinate_owners,
             sleep_freeze: None,
             actuation_efforts: None,
@@ -1694,6 +1720,9 @@ impl GpuArticulatedDynamicsBatch {
         &self,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), GpuArticulatedDynamicsError> {
+        if let Some(targets) = &self.motor_targets {
+            targets.encode_apply(&self.device, encoder);
+        }
         self.poses.encode(encoder);
         self.link_terms.encode(encoder);
         self.joint_forces.encode(encoder);
@@ -1766,11 +1795,150 @@ impl GpuArticulatedDynamicsBatch {
         self.timestep
     }
 
+    /// Configure resident scalar motor targets with one equally sized mapping per environment.
+    ///
+    /// Each mapping row is an action coordinate. Destinations must be unique within
+    /// an environment and name a scalar joint's child link and generalized slot.
+    /// Floating-root and spherical slots, scaled/offset mimic links, disabled motors,
+    /// and position targets on velocity-only motors are rejected before any change.
+    /// `delays[environment]` counts physics substeps that retain the previous target.
+    /// Reconfiguration cancels pending actions but retains currently applied targets.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for incompatible mappings, delays, native motors, or GPU capacity.
+    pub fn enable_motor_target_control(
+        &mut self,
+        mappings: &[Vec<GpuMotorTargetMapping>],
+        delays: &[u32],
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        let env_count = self.dimensions.len();
+        if mappings.len() != env_count || delays.len() != env_count {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let width = mappings.first().map_or(0, Vec::len);
+        if width == 0 || mappings.iter().any(|mapping| mapping.len() != width) {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let count = width
+            .checked_mul(env_count)
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        let limits = self.device.limits();
+        if count > u32::MAX as usize
+            || count.div_ceil(64) > limits.max_compute_workgroups_per_dimension as usize
+            || count as u64 * 16 > u64::from(limits.max_storage_buffer_binding_size)
+            || count as u64 * 16 > limits.max_buffer_size
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let accepted = self
+            .accepted_joints
+            .lock()
+            .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+        let mut packed = Vec::with_capacity(count);
+        let mut offset = 0;
+        for (env, mapping) in mappings.iter().enumerate() {
+            let mut used = std::collections::BTreeSet::new();
+            for (row, target) in mapping.iter().enumerate() {
+                let motor = accepted[env]
+                    .get(target.coordinate)
+                    .and_then(|joint| joint.motor)
+                    .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+                if !used.insert(target.coordinate)
+                    || !self.scalar_motor_links[env].contains(&(target.coordinate, target.link))
+                    || (target.mode == GpuMotorTargetMode::Position
+                        && motor.position_target.is_none())
+                {
+                    return Err(GpuArticulatedDynamicsError::InvalidInput);
+                }
+                let mode = match target.mode {
+                    GpuMotorTargetMode::Position => 0,
+                    GpuMotorTargetMode::Velocity => 1,
+                };
+                packed.push(PackedMotorTargetMapping {
+                    coordinate: u32::try_from(offset + target.coordinate)
+                        .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?,
+                    action: (row * env_count + env) as u32,
+                    mode,
+                    delay: delays[env],
+                });
+            }
+            offset += self.dimensions[env];
+        }
+        self.motor_targets = Some(GpuMotorTargetControl::new(
+            &self.device,
+            self.joint_forces.parameter_buffer(),
+            &packed,
+            env_count as u32,
+        ));
+        Ok(())
+    }
+
+    /// Latch actions from a STORAGE f32 buffer in `[actuated coordinate, environment]` order.
+    ///
+    /// The buffer must contain exactly mapping-width times environment-count values,
+    /// all finite, with position targets inside configured joint bounds. The caller
+    /// may encode its GPU action producer immediately before this pass on the same
+    /// encoder; there is no readback or CPU target upload. Each latch supersedes any
+    /// pending action and restarts each environment's configured delay. Delay zero
+    /// applies before the next force evaluation; delay k retains the old target for
+    /// exactly k contact/integration substeps, then applies before substep k + 1.
+    /// Both whole and split resident stepping APIs consume the delay on the GPU.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if control is not configured or buffer size/usage is incompatible.
+    pub fn encode_motor_targets(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        actions: &wgpu::Buffer,
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        let targets = self
+            .motor_targets
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        if !actions.usage().contains(wgpu::BufferUsages::STORAGE)
+            || actions.size() != targets.action_bytes()
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        targets.encode_latch(&self.device, encoder, actions);
+        Ok(())
+    }
+
+    /// Update per-environment substep delays from a resident `u32` STORAGE buffer.
+    ///
+    /// Supply one delay per environment. Pending actions restart their countdown;
+    /// applied targets stay unchanged. This may precede action scatter on the same
+    /// encoder after a GPU policy/randomization producer, without host readback.
+    pub fn encode_motor_target_delays(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        delays: &wgpu::Buffer,
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        let targets = self
+            .motor_targets
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        if !delays.usage().contains(wgpu::BufferUsages::STORAGE)
+            || delays.size() != self.dimensions.len() as u64 * 4
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        targets.encode_delays(&self.device, encoder, delays);
+        Ok(())
+    }
+
     /// Update raw joint efforts, motors, and passive laws for the next step.
     pub fn update_joints(
         &self,
         joints: &[Vec<GpuJointForceInput>],
     ) -> Result<(), GpuArticulatedDynamicsError> {
+        if self
+            .motor_targets
+            .as_ref()
+            .is_some_and(|targets| !targets.accepts_inputs(joints))
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
         if joints.len() != self.joint_bounds.len()
             || joints
                 .iter()
@@ -1802,6 +1970,11 @@ impl GpuArticulatedDynamicsBatch {
             .lock()
             .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
         self.joint_forces.update_inputs(joints)?;
+        // Host replacement owns the complete drive parameters, so stale GPU actions
+        // must not overwrite it on a later substep.
+        if let Some(targets) = &self.motor_targets {
+            targets.cancel(&self.queue);
+        }
         if self.sleep_freeze.is_some() {
             let mut requests = self
                 .poses
@@ -2564,6 +2737,9 @@ impl GpuArticulatedDynamicsBatch {
     /// Restore generalized coordinates and clear contact caches; quaternion poses are separate.
     pub fn reset(&self, states: &[GpuGeneralizedState]) -> Result<(), GpuArticulatedDynamicsError> {
         self.state.reset(states)?;
+        if let Some(targets) = &self.motor_targets {
+            targets.cancel(&self.queue);
+        }
         if let Some(contact) = &self.ground_contact {
             contact.clear_cached_impulses(&self.queue);
         }
@@ -2584,6 +2760,38 @@ impl GpuArticulatedDynamicsBatch {
             .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
             .enable_contact_activity()?;
         Ok(())
+    }
+
+    /// Create an explicitly sampled resident normal-impulse sensor for selected links.
+    /// Encode the returned sensor after the desired solved substep on the same encoder.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` without contact rows, or propagates invalid link selection/capacity.
+    pub fn normal_impulse_sensor(
+        &self,
+        links: &[usize],
+    ) -> Result<crate::gpu_contact_sensor::GpuContactImpulseSensor, GpuArticulatedDynamicsError>
+    {
+        Ok(self
+            .ground_contact
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
+            .normal_impulse_sensor(links)?)
+    }
+
+    /// Update resident contact correction and warm-start policy without reallocating rows.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` without contact rows, or propagates invalid policy values.
+    pub fn update_contact_policy(
+        &self,
+        policy: crate::gpu_contact_policy::GpuContactPolicy,
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        Ok(self
+            .ground_contact
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
+            .update_contact_policy(&self.queue, policy)?)
     }
 
     /// Download solved-impulse activity per environment and stable link index.
@@ -3176,6 +3384,10 @@ fn spherical_baseline_only(joints: &[GpuJointForceInput], slots: &[usize]) -> bo
             })
     })
 }
+
+#[cfg(test)]
+#[path = "gpu_motor_target_tests.rs"]
+mod motor_target_tests;
 
 #[cfg(test)]
 mod tests {

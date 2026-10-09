@@ -89,6 +89,10 @@ pub struct GpuArticulatedJointForceBatch {
 }
 
 impl GpuArticulatedJointForceBatch {
+    pub(crate) fn parameter_buffer(&self) -> &wgpu::Buffer {
+        &self.parameters
+    }
+
     /// Bind matching state and force batches with one parameter per coordinate.
     pub fn new(
         state: &GpuGeneralizedStateBatch,
@@ -192,7 +196,9 @@ impl GpuArticulatedJointForceBatch {
         let parameters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera articulated joint force parameters"),
             contents: bytemuck::cast_slice(&parameters),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
         });
         let owners = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera articulated joint force owners"),
