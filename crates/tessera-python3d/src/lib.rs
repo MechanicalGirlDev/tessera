@@ -50,7 +50,8 @@ use tessera_physics::inverse_kinematics::{
 use tessera_physics::material::{CoefficientCombineRule, ColliderMaterial};
 use tessera_physics::mesh::{HeightFieldGeometry, PolylineGeometry, TriangleMeshGeometry};
 use tessera_physics::mjcf::{
-    LoadedMjcf, MjcfLoadOptions, load_mjcf_str, load_mjcf_str_with_mesh_resolver,
+    LoadedMjcf, MjcfActuatorKind as CoreMjcfActuatorKind, MjcfActuators, MjcfLoadOptions,
+    load_mjcf_str, load_mjcf_str_with_mesh_resolver,
 };
 use tessera_physics::sphere_world::{
     SphereBody, SphereWorld as CoreSphereWorld, SphereWorldParams,
@@ -2686,9 +2687,62 @@ impl SphereWorld {
     }
 }
 
+/// Imported stateless MJCF actuator dynamics.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum MjcfActuatorDynamics {
+    /// Geared constant-force motor.
+    Motor,
+    /// Scalar position servo.
+    Position {
+        /// Position gain.
+        kp: f64,
+        /// Velocity damping.
+        kv: f64,
+    },
+    /// Scalar velocity servo.
+    Velocity {
+        /// Velocity gain.
+        kv: f64,
+    },
+    /// Control-scaled zero-velocity damper.
+    Damper {
+        /// Damping gain.
+        gain: f64,
+    },
+    /// Fixed-gain general actuator.
+    General {
+        /// Control gain.
+        gain: f64,
+        /// Constant, position and velocity bias coefficients.
+        bias: Vec<f64>,
+        /// Restoring affine servo branch.
+        affine: bool,
+    },
+}
+
+/// MJCF actuator metadata in stable XML declaration order.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MjcfActuatorInfo {
+    /// Explicit or generated actuator name.
+    pub name: String,
+    /// Referenced scalar joint.
+    pub joint: String,
+    /// Native generalized-coordinate index.
+    pub coordinate: u32,
+    /// Supported dynamics.
+    pub dynamics: MjcfActuatorDynamics,
+    /// Motor gear.
+    pub gear: f64,
+    /// Enabled control clamp; empty when unlimited.
+    pub control_range: Vec<f64>,
+    /// Enabled force clamp; empty when unlimited.
+    pub force_range: Vec<f64>,
+}
+
 #[derive(Debug)]
 struct ArticulatedInner {
     world: CoreArticulatedWorld,
+    actuators: MjcfActuators,
     gpu: Option<GpuContactDevice>,
     resident: Option<(f64, GpuSceneDynamics)>,
 }
@@ -2718,6 +2772,7 @@ impl ArticulatedWorld {
         Ok(Arc::new(Self {
             inner: Mutex::new(ArticulatedInner {
                 world: loaded.world,
+                actuators: MjcfActuators::default(),
                 gpu: None,
                 resident: None,
             }),
@@ -2742,6 +2797,7 @@ impl ArticulatedWorld {
         Ok(Arc::new(Self {
             inner: Mutex::new(ArticulatedInner {
                 world: loaded.world,
+                actuators: loaded.actuators,
                 gpu: None,
                 resident: None,
             }),
@@ -2825,6 +2881,74 @@ impl ArticulatedWorld {
     /// Joint names and generalized-coordinate ranges.
     pub fn joint_ranges(&self) -> Vec<JointRange> {
         self.joint_ranges.clone()
+    }
+
+    /// Imported actuator metadata in XML declaration order.
+    pub fn actuator_info(&self) -> Result<Vec<MjcfActuatorInfo>, TesseraError> {
+        locked(&self.inner)?
+            .actuators
+            .entries()
+            .iter()
+            .map(|a| {
+                let dynamics = match a.kind {
+                    CoreMjcfActuatorKind::Motor => MjcfActuatorDynamics::Motor,
+                    CoreMjcfActuatorKind::Position { kp, kv } => {
+                        MjcfActuatorDynamics::Position { kp, kv }
+                    }
+                    CoreMjcfActuatorKind::Velocity { kv } => MjcfActuatorDynamics::Velocity { kv },
+                    CoreMjcfActuatorKind::Damper { gain } => MjcfActuatorDynamics::Damper { gain },
+                    CoreMjcfActuatorKind::General { gain, bias, affine } => {
+                        MjcfActuatorDynamics::General {
+                            gain,
+                            bias: bias.to_vec(),
+                            affine,
+                        }
+                    }
+                };
+                Ok(MjcfActuatorInfo {
+                    name: a.name.clone(),
+                    joint: a.joint.clone(),
+                    coordinate: u32::try_from(a.coordinate).map_err(failed)?,
+                    dynamics,
+                    gear: a.gear,
+                    control_range: a.control_range.map_or_else(Vec::new, |r| r.to_vec()),
+                    force_range: a.force_range.map_or_else(Vec::new, |r| r.to_vec()),
+                })
+            })
+            .collect()
+    }
+
+    /// Stable imported actuator names, independent of coordinate order.
+    pub fn actuator_names(&self) -> Result<Vec<String>, TesseraError> {
+        Ok(locked(&self.inner)?
+            .actuators
+            .entries()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect())
+    }
+
+    /// Last accepted actuator-order controls.
+    pub fn controls(&self) -> Result<Vec<f64>, TesseraError> {
+        Ok(locked(&self.inner)?.actuators.controls().to_vec())
+    }
+
+    /// Atomically replace actuator-order controls.
+    pub fn set_controls(&self, controls: Vec<f64>) -> Result<(), TesseraError> {
+        locked(&self.inner)?
+            .actuators
+            .set_controls(&controls)
+            .map_err(failed)
+    }
+
+    /// Advance CPU dynamics using held imported actuator controls.
+    pub fn step_controls(&self, dt: f64) -> Result<(), TesseraError> {
+        let mut inner = locked(&self.inner)?;
+        inner.resident = None;
+        let ArticulatedInner {
+            world, actuators, ..
+        } = &mut *inner;
+        actuators.step(world, dt).map_err(failed)
     }
 
     /// Enable or disable contacts between nonadjacent links.
@@ -3569,6 +3693,7 @@ impl ArticulatedWorld {
             world,
             gpu,
             resident,
+            ..
         } = &mut *inner;
         if !resident.as_ref().is_some_and(|(dt, _)| *dt == timestep) {
             let context = gpu.as_ref().ok_or_else(|| failed("GPU unavailable"))?;
@@ -6966,6 +7091,54 @@ mod tests {
         let wrench = world.link_contact_wrench(1).unwrap();
         assert_eq!(wrench.force.z, 3.0);
         assert_eq!(wrench.torque.z, 6.0);
+    }
+
+    #[test]
+    fn mjcf_actuator_binding_preserves_metadata_and_native_controls() {
+        let xml = r#"<mujoco><option gravity="0 0 0"/><worldbody>
+          <body name="root"><inertial mass="1" diaginertia="1 1 1"/>
+            <body name="first"><joint name="a" type="slide" axis="1 0 0"/>
+              <inertial mass="1" diaginertia="1 1 1"/></body>
+            <body name="second"><joint name="b"/>
+              <inertial mass="1" diaginertia="1 1 1"/></body>
+          </body></worldbody><actuator>
+            <motor name="motor_b" joint="b" gear="-2" forcerange="-3 3"/>
+            <position name="servo_a" joint="a" kp="25" kv="8" ctrlrange="-1 1"/>
+          </actuator></mujoco>"#;
+        let world = ArticulatedWorld::from_mjcf(xml.into()).unwrap();
+        assert_eq!(world.actuator_names().unwrap(), ["motor_b", "servo_a"]);
+        let info = world.actuator_info().unwrap();
+        assert_eq!(info[0].coordinate, 1);
+        assert_eq!(info[0].gear, -2.0);
+        assert_eq!(info[0].force_range, [-3.0, 3.0]);
+        assert_eq!(info[1].coordinate, 0);
+        assert_eq!(info[1].control_range, [-1.0, 1.0]);
+        assert!(matches!(
+            info[1].dynamics,
+            MjcfActuatorDynamics::Position { kp: 25.0, kv: 8.0 }
+        ));
+        world.set_controls(vec![2.0, 0.5]).unwrap();
+        for invalid in [vec![2.0], vec![2.0, f64::NAN]] {
+            assert!(world.set_controls(invalid).is_err());
+            assert_eq!(world.controls().unwrap(), [2.0, 0.5]);
+            assert_eq!(world.positions().unwrap(), [0.0, 0.0]);
+        }
+        let mut native = load_mjcf_str(xml, MjcfLoadOptions::default()).unwrap();
+        native.set_controls(&[2.0, 0.5]).unwrap();
+        for _ in 0..1000 {
+            world.step_controls(0.002).unwrap();
+            native.step(0.002).unwrap();
+        }
+        assert_eq!(
+            world.positions().unwrap(),
+            native.world.positions.as_slice()
+        );
+        assert_eq!(
+            world.velocities().unwrap(),
+            native.world.velocities.as_slice()
+        );
+        assert!((world.positions().unwrap()[0] - 0.5).abs() < 0.01);
+        assert!(world.velocities().unwrap()[1] < 0.0);
     }
 
     #[test]

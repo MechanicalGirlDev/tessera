@@ -23,6 +23,10 @@ use crate::articulation::{Articulation, ArticulationError, JointKind, JointSpec,
 use crate::convex::ConvexGeometry;
 use crate::mesh::ConvexMeshResolver;
 
+#[path = "mjcf_actuator.rs"]
+mod actuator;
+pub use actuator::{MjcfActuatorInfo, MjcfActuatorKind, MjcfActuators};
+
 /// Mesh resolver accepted by [`load_mjcf_str_with_mesh_resolver`].
 pub use crate::mesh::ConvexMeshResolver as MjcfMeshResolver;
 
@@ -67,6 +71,8 @@ pub struct LoadedMjcf {
     /// Joint metadata in articulation edge order. A multi-root `freejoint`
     /// expands into named `tx`, `ty`, `tz`, and `rotation` joints.
     pub joints: Vec<MjcfJointInfo>,
+    /// Imported actuators and controls in XML declaration order.
+    pub actuators: MjcfActuators,
     /// Constructed fixed-root or floating-root physics world.
     pub world: ArticulatedWorld,
 }
@@ -184,12 +190,15 @@ struct ParsedSite {
 struct DefaultClass {
     geom: BTreeMap<String, String>,
     joint: BTreeMap<String, String>,
+    actuators: BTreeMap<String, BTreeMap<String, String>>,
+    actuator_parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum DefaultElement {
     Geom,
     Joint,
+    Actuator(&'static str),
 }
 
 #[derive(Debug)]
@@ -557,10 +566,12 @@ fn load_mjcf_inner(
     world.set_convex_shapes(state.convex_shapes)?;
     add_world_geometries(&mut world, parsed.world_geoms)?;
 
+    let actuators = actuator::import(xml, &state.joint_info)?;
     Ok(LoadedMjcf {
         model_name: parsed.name,
         link_names: state.link_names,
         joints: state.joint_info,
+        actuators,
         world,
     })
 }
@@ -1398,6 +1409,11 @@ fn collect_defaults(xml: &str) -> Result<BTreeMap<String, DefaultClass>, MjcfLoa
                 let kind = match element.name().as_ref() {
                     b"geom" => Some(DefaultElement::Geom),
                     b"joint" => Some(DefaultElement::Joint),
+                    b"motor" => Some(DefaultElement::Actuator("motor")),
+                    b"position" => Some(DefaultElement::Actuator("position")),
+                    b"velocity" => Some(DefaultElement::Actuator("velocity")),
+                    b"damper" => Some(DefaultElement::Actuator("damper")),
+                    b"general" => Some(DefaultElement::Actuator("general")),
                     _ => None,
                 };
                 if let Some(kind) = kind {
@@ -1445,9 +1461,11 @@ fn push_default_class(
     }
     if !classes.contains_key(&class) {
         let parent = stack.last().map(String::as_str).unwrap_or_default();
-        let inherited = classes.get(parent).cloned().ok_or_else(|| {
+        let mut inherited = classes.get(parent).cloned().ok_or_else(|| {
             MjcfLoadError::Invalid(format!("unknown parent default class `{parent}`"))
         })?;
+        inherited.actuators.clear();
+        inherited.actuator_parent = Some(parent.into());
         let _previous = classes.insert(class.clone(), inherited);
     }
     stack.push(class);
@@ -1466,6 +1484,7 @@ fn update_default_class(
     let target = match kind {
         DefaultElement::Geom => &mut defaults.geom,
         DefaultElement::Joint => &mut defaults.joint,
+        DefaultElement::Actuator(kind) => defaults.actuators.entry(kind.into()).or_default(),
     };
     for (key, value) in attrs {
         if key != "class" {
@@ -1492,6 +1511,26 @@ fn resolve_defaults(
     let mut merged = match kind {
         DefaultElement::Geom => defaults.geom.clone(),
         DefaultElement::Joint => defaults.joint.clone(),
+        DefaultElement::Actuator(kind) => {
+            let mut chain = vec![defaults];
+            let mut current = defaults;
+            while let Some(parent) = &current.actuator_parent {
+                current = classes.get(parent).ok_or_else(|| {
+                    MjcfLoadError::Invalid(format!("unknown parent default class `{parent}`"))
+                })?;
+                chain.push(current);
+            }
+            let mut merged = BTreeMap::new();
+            for class in chain.into_iter().rev() {
+                if let Some(attrs) = class.actuators.get(kind) {
+                    merged.extend(attrs.clone());
+                }
+                if let Some(attrs) = class.actuators.get("general") {
+                    merged.extend(attrs.clone());
+                }
+            }
+            merged
+        }
     };
     for (key, value) in explicit {
         let _previous = merged.insert(key, value);
