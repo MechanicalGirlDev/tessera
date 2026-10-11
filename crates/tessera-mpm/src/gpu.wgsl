@@ -394,6 +394,9 @@ fn obstacle_contact_velocity(
     }
     let relative = velocity - surface_velocity;
     let normal_speed = dot(relative, normal);
+    if boundary == 4.0 {
+        return velocity - normal * normal_speed;
+    }
     if normal_speed >= 0.0 {
         return velocity;
     }
@@ -555,7 +558,7 @@ struct PlasticProjection {
 }
 
 fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProjection {
-    if particle.material.x == 6.0 && particle.material.y == 0.0 {
+    if (particle.material.x == 5.0 || particle.material.x == 6.0) && particle.material.y == 0.0 {
         return PlasticProjection(deformation, vec4<f32>(particle.material_extra.xyz, 1.0));
     }
     let axes = principal_axes(deformation);
@@ -589,11 +592,9 @@ fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProje
     let norm = length(deviatoric);
     let cohesion = particle.projection.x;
     let shifted_trace = trace - cohesion;
-    var angle = particle.material_extra.w;
-    if particle.material.x == 6.0 {
-        let q = particle.material_extra.y;
-        angle += (0.15707963267948966 * q - 0.17453292519943295) * exp(-0.2 * q);
-    }
+    let q = particle.material_extra.y;
+    let angle = particle.material_extra.w
+        + (0.15707963267948966 * q - 0.17453292519943295) * exp(-0.2 * q);
     let angle_sine = sin(angle);
     let alpha = sqrt(2.0 / 3.0) * (2.0 * angle_sine) / (3.0 - angle_sine);
     var plastic = vec3<f32>(
@@ -603,9 +604,8 @@ fn project_plastic(deformation: mat3x3<f32>, particle: Particle) -> PlasticProje
     );
     var projected_log = vec3<f32>(cohesion / 3.0);
     // Match the CPU model's f32-aware isotropic strain classification.
-    let apex = shifted_trace > 0.0
-        || select(norm <= 1e-12, norm <= 0.000000476837158203125, particle.material.x == 6.0);
-    if apex && particle.material.x == 6.0 {
+    let apex = shifted_trace > 0.0 || norm <= 0.000000476837158203125;
+    if apex {
         plastic.y += length(strain);
     }
     if !apex {

@@ -48,6 +48,22 @@ impl Default for MpmParams {
     }
 }
 
+impl MpmParams {
+    /// Check integration parameters without modifying particle state.
+    pub fn validate(&self) -> Result<(), MpmError> {
+        if !self.cell_width.is_finite()
+            || self.cell_width <= 0.0
+            || self.gravity.iter().any(|value| !value.is_finite())
+            || !self.max_substep.is_finite()
+            || self.max_substep <= 0.0
+            || self.bounds.is_some_and(|bounds| !bounds.is_valid())
+        {
+            return Err(MpmError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
 /// One material point and its persistent APIC state.
 #[derive(Debug, Clone)]
 pub struct MpmParticle {
@@ -114,7 +130,10 @@ impl MpmParticle {
             radius,
             material,
             plastic: PlasticState {
-                hardening: if matches!(material, MaterialModel::SandNeoHookean { .. }) {
+                hardening: if matches!(
+                    material,
+                    MaterialModel::Sand { .. } | MaterialModel::SandNeoHookean { .. }
+                ) {
                     1.0
                 } else {
                     0.0
@@ -195,20 +214,17 @@ pub struct MpmWorld {
     pub obstacles: Vec<RigidObstacle>,
     /// Number of explicit substeps completed since construction.
     pub substeps: u64,
+    /// Whether obstacle CPIC side coloring participates in grid transfers.
+    /// Explicit particle transfer colors remain active when this is disabled.
+    pub use_cpic: bool,
     next_chunk_id: u64,
 }
 
 impl MpmWorld {
     /// Validate particles and construct a deterministic CPU reference world.
     pub fn new(mut particles: Vec<MpmParticle>, params: MpmParams) -> Result<Self, MpmError> {
-        if !params.cell_width.is_finite()
-            || params.cell_width <= 0.0
-            || params.gravity.iter().any(|value| !value.is_finite())
-            || !params.max_substep.is_finite()
-            || params.max_substep <= 0.0
-            || params.bounds.is_some_and(|bounds| !bounds.is_valid())
-            || particles.iter().any(|particle| !valid_particle(particle))
-        {
+        params.validate()?;
+        if particles.iter().any(|particle| !valid_particle(particle)) {
             return Err(MpmError::InvalidInput);
         }
         for particle in &mut particles {
@@ -219,6 +235,7 @@ impl MpmWorld {
             params,
             obstacles: Vec::new(),
             substeps: 0,
+            use_cpic: true,
             next_chunk_id: 1,
         })
     }
@@ -352,7 +369,9 @@ impl MpmWorld {
         let transfer_keys = self
             .particles
             .iter()
-            .map(|particle| transfer_key(particle, &self.obstacles))
+            .map(|particle| {
+                transfer_key(particle, if self.use_cpic { &self.obstacles } else { &[] })
+            })
             .collect::<Vec<_>>();
         let mut grid = BTreeMap::<([i32; 3], u64), GridNode>::new();
 
@@ -729,6 +748,18 @@ mod tests {
         let mut separated =
             MpmWorld::new(vec![left.clone(), right.clone()], params.clone()).unwrap();
         separated.set_obstacles(vec![sheet.clone()]).unwrap();
+        let mut disabled = separated.clone();
+        disabled.use_cpic = false;
+        disabled.step(0.001).unwrap();
+        assert!(disabled.particles[0].velocity.x.abs() < 0.5);
+        assert!(disabled.particles[1].velocity.x.abs() < 0.5);
+        assert_eq!(disabled.obstacles[0].cpic_group, Some(0));
+        let mut explicit_colors = separated.clone();
+        explicit_colors.use_cpic = false;
+        explicit_colors.particles[1].transfer_color = 1;
+        explicit_colors.step(0.001).unwrap();
+        assert!(explicit_colors.particles[0].velocity.x < -0.9);
+        assert!(explicit_colors.particles[1].velocity.x > 0.9);
         separated.step(0.001).unwrap();
         assert!(
             separated.particles[0].velocity.x < -0.9,

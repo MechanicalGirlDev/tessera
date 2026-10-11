@@ -262,7 +262,7 @@ impl<'a> GpuMpmResidentSession<'a> {
             device,
             &world.particles,
             &world.params,
-            &world.obstacles,
+            &cpic_obstacles(&world.obstacles, world.use_cpic),
             substep_dt,
             true,
         )?;
@@ -498,7 +498,8 @@ impl<'a> GpuMpmResidentSession<'a> {
         if obstacles.iter().any(|obstacle| !obstacle.is_valid()) {
             return Err(GpuMpmError::Reference(MpmError::InvalidInput));
         }
-        let needs_sparse_rebuild = obstacles
+        let effective = cpic_obstacles(&obstacles, self.world.use_cpic);
+        let needs_sparse_rebuild = effective
             .iter()
             .any(|obstacle| obstacle.cpic_group.is_some())
             && self
@@ -514,14 +515,14 @@ impl<'a> GpuMpmResidentSession<'a> {
                 &self.device,
                 &self.world.particles,
                 &self.world.params,
-                &obstacles,
+                &effective,
                 self.substep_dt,
                 true,
             )?;
             self.prepared = replacement;
         } else if let Some(prepared) = &mut self.prepared {
             self.gpu
-                .replace_obstacles(&self.device, prepared, &obstacles)?;
+                .replace_obstacles(&self.device, prepared, &effective)?;
         }
         self.world.set_obstacles(obstacles)?;
         Ok(())
@@ -568,7 +569,7 @@ impl<'a> GpuMpmResidentSession<'a> {
             &self.device,
             &updated.particles,
             &updated.params,
-            &updated.obstacles,
+            &cpic_obstacles(&updated.obstacles, updated.use_cpic),
             self.substep_dt,
             true,
         )?;
@@ -661,6 +662,7 @@ impl<'a> GpuMpmResidentSession<'a> {
 }
 
 fn validate_resident_world(world: &MpmWorld, substep_dt: f64) -> Result<(), GpuMpmError> {
+    world.params.validate()?;
     if !substep_dt.is_finite()
         || substep_dt <= 0.0
         || !world.params.max_substep.is_finite()
@@ -672,6 +674,23 @@ fn validate_resident_world(world: &MpmWorld, substep_dt: f64) -> Result<(), GpuM
         return Err(GpuMpmError::Reference(MpmError::InvalidInput));
     }
     Ok(())
+}
+
+fn cpic_obstacles(obstacles: &[RigidObstacle], enabled: bool) -> Cow<'_, [RigidObstacle]> {
+    if enabled {
+        Cow::Borrowed(obstacles)
+    } else {
+        Cow::Owned(
+            obstacles
+                .iter()
+                .cloned()
+                .map(|mut obstacle| {
+                    obstacle.cpic_group = None;
+                    obstacle
+                })
+                .collect(),
+        )
+    }
 }
 
 struct GridTopology {
@@ -2136,6 +2155,7 @@ fn pack_obstacle(
                 crate::ObstacleBoundary::Stick => 1.0,
                 crate::ObstacleBoundary::Separate => 2.0,
                 crate::ObstacleBoundary::NonReflecting => 3.0,
+                crate::ObstacleBoundary::FreeSlip => 4.0,
             },
         )?,
         triangle_a: triangle_vertices[0],
@@ -2170,7 +2190,7 @@ impl MpmWorld {
             (device, queue),
             &self.particles,
             &self.params,
-            &self.obstacles,
+            &cpic_obstacles(&self.obstacles, self.use_cpic),
             substep_dt,
             steps,
         )?;
@@ -2208,7 +2228,7 @@ impl MpmWorld {
                 queue,
                 &self.particles,
                 &self.params,
-                &self.obstacles,
+                &cpic_obstacles(&self.obstacles, self.use_cpic),
                 substep,
             )?;
             self.apply_gpu_transfers(transfers)?;
@@ -2248,7 +2268,7 @@ impl MpmWorld {
                 queue,
                 &self.particles,
                 &self.params,
-                &self.obstacles,
+                &cpic_obstacles(&self.obstacles, self.use_cpic),
                 substep,
             )?;
             self.apply_gpu_transfers(transfers)?;
@@ -2421,6 +2441,159 @@ mod tests {
                 }
                 assert!(gpu.particles[2].plastic.hardening > particles[2].plastic.hardening);
                 assert!(gpu.particles[4].plastic.hardening > particles[4].plastic.hardening);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_sand_hardening_tracks_multiload_cpu_and_resident_state() {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .unwrap();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let mut particles = [
+            MaterialModel::sand(4_000.0, 0.2, 35.0f64.to_radians(), 0.0),
+            MaterialModel::sand_neo_hookean(4_000.0, 0.2, 35.0f64.to_radians(), 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, material)| {
+            MpmParticle::new(
+                Vector3::new(0.3 + index as f64 * 0.4, 0.5, 0.5),
+                0.04,
+                1_000.0,
+                material,
+            )
+        })
+        .collect::<Vec<_>>();
+        let params = MpmParams {
+            gravity: Vector3::zeros(),
+            ..MpmParams::default()
+        };
+        let pipeline = GpuMpmTransfers::new(&device);
+        let dt = 0.00001;
+        for load in [
+            Vector3::new(0.15, -0.25, -0.1),
+            Vector3::new(0.15, -0.25, -0.1),
+            Vector3::repeat(1.2f64.ln()),
+            Vector3::new(0.15, -0.25, -0.1),
+        ] {
+            for particle in &mut particles {
+                particle.deformation = Matrix3::from_diagonal(&load.map(f64::exp));
+            }
+            let transfers = pipeline
+                .transfer(&device, &queue, &particles, &params, &[], dt)
+                .unwrap();
+            for (particle, transfer) in particles.iter_mut().zip(transfers) {
+                assert_eq!(transfer.plastic[3], 1.0);
+                let integrated =
+                    (Matrix3::identity() + transfer.affine() * dt) * particle.deformation;
+                let (expected, state) = particle
+                    .material
+                    .project_deformation(integrated, particle.plastic);
+                assert!((expected - transfer.deformation()).norm() < 2e-5);
+                assert!((state.hardening - transfer.plastic().hardening).abs() < 2e-5);
+                assert!((state.plastic_det - transfer.plastic().plastic_det).abs() < 2e-5);
+                assert!((state.log_volume_gain - transfer.plastic().log_volume_gain).abs() < 2e-5);
+                assert!(state.hardening > particle.plastic.hardening);
+                particle.plastic = transfer.plastic();
+                particle.deformation = transfer.deformation();
+            }
+        }
+        let mut cpu = MpmWorld::new(particles, params).unwrap();
+        let mut resident =
+            GpuMpmResidentSession::new(&pipeline, &device, &queue, cpu.clone(), dt).unwrap();
+        resident.submit_steps(5).unwrap();
+        for _ in 0..5 {
+            cpu.step(dt).unwrap();
+        }
+        resident.synchronize().unwrap();
+        for (expected, actual) in cpu.particles.iter().zip(&resident.world().particles) {
+            assert!((expected.deformation - actual.deformation).norm() < 3e-5);
+            assert!((expected.plastic.hardening - actual.plastic.hardening).abs() < 3e-5);
+            assert!((expected.plastic.plastic_det - actual.plastic.plastic_det).abs() < 3e-5);
+            assert!(
+                (expected.plastic.log_volume_gain - actual.plastic.log_volume_gain).abs() < 3e-5
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_free_slip_matches_cpu_resident_and_reaction_momentum_both_directions() {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .unwrap();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let pipeline = GpuMpmTransfers::new(&device);
+        for boundary in [
+            crate::ObstacleBoundary::FreeSlip,
+            crate::ObstacleBoundary::Separate,
+            crate::ObstacleBoundary::Slip,
+        ] {
+            for speed in [-0.8, 0.8] {
+                let mut particle = MpmParticle::new(
+                    Vector3::new(0.5, 0.5, 0.01),
+                    0.04,
+                    1_000.0,
+                    MaterialModel::elastic(1_000.0, 0.2),
+                );
+                particle.velocity = Vector3::new(0.7, -0.2, 0.4 + speed);
+                let initial_momentum = particle.velocity * particle.mass;
+                let mut obstacle = RigidObstacle::ground(
+                    Vector3::zeros(),
+                    nalgebra::Vector2::repeat(2.0),
+                    UnitQuaternion::identity(),
+                );
+                obstacle.linear_velocity = Vector3::new(0.2, 0.3, 0.4);
+                obstacle.angular_velocity = Vector3::new(0.0, 0.0, 0.5);
+                obstacle.friction = 0.5;
+                obstacle.boundary = boundary;
+                let params = MpmParams {
+                    gravity: Vector3::zeros(),
+                    ..MpmParams::default()
+                };
+                let mut cpu = MpmWorld::new(vec![particle], params).unwrap();
+                cpu.set_obstacles(vec![obstacle]).unwrap();
+                let mut gpu = cpu.clone();
+                let mut resident =
+                    GpuMpmResidentSession::new(&pipeline, &device, &queue, cpu.clone(), 0.0001)
+                        .unwrap();
+                let expected = cpu.step_with_obstacle_reactions(0.0001).unwrap();
+                let actual = gpu
+                    .step_with_gpu_obstacle_reactions(&pipeline, &device, &queue, 0.0001)
+                    .unwrap();
+                resident.step(1).unwrap();
+                assert!((actual[0].linear - expected[0].linear).norm() < 2e-5);
+                assert!((actual[0].angular - expected[0].angular).norm() < 2e-5);
+                for world in [&cpu, &gpu, resident.world()] {
+                    let result = &world.particles[0];
+                    assert!((result.velocity - cpu.particles[0].velocity).norm() < 2e-5);
+                    assert!((result.position - cpu.particles[0].position).norm() < 2e-5);
+                    if boundary == crate::ObstacleBoundary::FreeSlip {
+                        assert!((result.velocity.z - 0.4).abs() < 2e-5);
+                        assert!((result.velocity.x - 0.7).abs() < 2e-5);
+                        assert!((result.velocity.y + 0.2).abs() < 2e-5);
+                    } else if speed > 0.0 {
+                        assert!((result.velocity.z - 1.2).abs() < 2e-5);
+                    }
+                }
+                let final_momentum = gpu.particles[0].velocity * gpu.particles[0].mass;
+                assert!((actual[0].linear + final_momentum - initial_momentum).norm() < 2e-5);
+                if boundary == crate::ObstacleBoundary::FreeSlip {
+                    assert!(actual[0].linear.z * speed > 0.0);
+                } else if speed > 0.0 {
+                    assert!(actual[0].linear.norm() < 2e-5);
+                }
             }
         }
     }
@@ -4063,9 +4236,14 @@ mod tests {
             ..MpmParams::default()
         };
         let transfers = GpuMpmTransfers::new(&device);
-        for (group, left_color, all_groups) in
-            [(0, 0, false), (16, 1, false), (31, 0, false), (31, 0, true)]
-        {
+        for (group, left_color, all_groups, enabled) in [
+            (0, 0, false, true),
+            (16, 1, false, true),
+            (31, 0, false, true),
+            (31, 0, true, true),
+            (0, 0, false, false),
+            (31, 1, true, false),
+        ] {
             let mut left = left.clone();
             left.transfer_color = left_color;
             let obstacles = (if all_groups { 0..32 } else { group..group + 1 })
@@ -4077,10 +4255,16 @@ mod tests {
                 .collect();
             let mut world = MpmWorld::new(vec![left, right.clone()], params.clone()).unwrap();
             world.set_obstacles(obstacles).unwrap();
+            world.use_cpic = enabled;
             let mut cpu = world.clone();
             cpu.step(0.001).unwrap();
-            assert!(cpu.particles[0].velocity.x < -0.9, "group {group}");
-            assert!(cpu.particles[1].velocity.x > 0.9, "group {group}");
+            if enabled || left_color != 0 {
+                assert!(cpu.particles[0].velocity.x < -0.9, "group {group}");
+                assert!(cpu.particles[1].velocity.x > 0.9, "group {group}");
+            } else {
+                assert!(cpu.particles[0].velocity.x.abs() < 0.5);
+                assert!(cpu.particles[1].velocity.x.abs() < 0.5);
+            }
             let mut direct = world.clone();
             direct
                 .step_with_gpu_transfers(&transfers, &device, &queue, 0.001)
@@ -4312,8 +4496,11 @@ mod tests {
                     < 2e-5
             );
         }
-        assert_eq!(first_transfer[3].plastic().hardening, 0.0);
-        assert!(first_transfer[4].plastic().hardening > 0.0);
+        assert_eq!(
+            first_transfer[3].plastic().hardening,
+            cpu.particles[3].plastic.hardening
+        );
+        assert!(first_transfer[4].plastic().hardening > cpu.particles[4].plastic.hardening);
         for _ in 0..12 {
             cpu.step(0.001).unwrap();
             gpu.step_with_gpu_transfers(&pipeline, &device, &queue, 0.001)

@@ -72,6 +72,8 @@ pub enum ObstacleBoundary {
     Separate,
     /// Project penetrated positions without changing particle or grid velocity.
     NonReflecting,
+    /// Remove relative normal velocity in both directions, preserving tangential slip.
+    FreeSlip,
 }
 
 /// A prescribed rigid pose and velocity used for one-way MPM contact.
@@ -517,6 +519,9 @@ impl RigidObstacle {
         }
         let relative = velocity - surface_velocity;
         let normal_speed = relative.dot(&normal);
+        if self.boundary == ObstacleBoundary::FreeSlip {
+            return velocity - normal * normal_speed;
+        }
         if normal_speed >= 0.0 {
             return velocity;
         }
@@ -825,6 +830,7 @@ mod tests {
             (ObstacleBoundary::Stick, Vector3::new(1.0, 0.0, 0.0)),
             (ObstacleBoundary::Separate, Vector3::new(1.0, 2.0, 0.0)),
             (ObstacleBoundary::NonReflecting, incoming),
+            (ObstacleBoundary::FreeSlip, Vector3::new(1.0, 2.0, 0.0)),
         ];
         for (boundary, expected) in cases {
             sphere.boundary = boundary;
@@ -833,6 +839,42 @@ mod tests {
                 (actual - expected).norm() < 1e-12,
                 "{boundary:?}: {actual:?}"
             );
+        }
+    }
+
+    #[test]
+    fn free_slip_removes_both_signs_of_moving_surface_relative_normal_velocity() {
+        let mut sphere = RigidObstacle::sphere(Vector3::zeros(), 1.0);
+        sphere.linear_velocity = Vector3::new(1.0, 2.0, 3.0);
+        sphere.angular_velocity = Vector3::new(0.0, 0.0, 2.0);
+        sphere.friction = 10.0;
+        let point = Vector3::x();
+        let surface = sphere.point_velocity(point);
+        for normal_speed in [-2.0, 2.0] {
+            let velocity = surface + Vector3::new(normal_speed, 4.0, -3.0);
+            sphere.boundary = ObstacleBoundary::FreeSlip;
+            assert!(
+                (sphere.contact_velocity(point, velocity, Vector3::x())
+                    - (surface + Vector3::new(0.0, 4.0, -3.0)))
+                .norm()
+                    < 1e-12
+            );
+            for boundary in [ObstacleBoundary::Slip, ObstacleBoundary::Separate] {
+                sphere.boundary = boundary;
+                if normal_speed > 0.0 {
+                    assert_eq!(
+                        sphere.contact_velocity(point, velocity, Vector3::x()),
+                        velocity
+                    );
+                } else {
+                    let result = sphere.contact_velocity(point, velocity, Vector3::x());
+                    assert!((result.x - surface.x).abs() < 1e-12);
+                    if boundary == ObstacleBoundary::Separate {
+                        assert!((result.y - velocity.y).abs() < 1e-12);
+                        assert!((result.z - velocity.z).abs() < 1e-12);
+                    }
+                }
+            }
         }
     }
 

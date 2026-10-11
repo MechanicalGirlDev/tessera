@@ -40,13 +40,14 @@ pub enum MaterialModel {
         /// Poisson ratio.
         poisson_ratio: f64,
     },
-    /// Drucker-Prager granular material.
+    /// Corotated sand with hardening Drucker-Prager plasticity.
     Sand {
         /// Young's modulus in pascals.
         young_modulus: f64,
         /// Poisson ratio.
         poisson_ratio: f64,
-        /// Internal friction angle in radians.
+        /// Asymptotic friction angle (`ha`) in radians; Nexus uses 35 degrees.
+        /// The current angle is `ha + (9 degrees * q - 10 degrees) * exp(-0.2 * q)`.
         friction_angle: f64,
         /// Tensile yield offset in logarithmic volumetric strain.
         cohesion: f64,
@@ -115,7 +116,7 @@ impl MaterialModel {
         }
     }
 
-    /// Construct dry or cohesive sand.
+    /// Construct dry or cohesive corotated sand with Drucker-Prager hardening.
     pub fn sand(
         young_modulus: f64,
         poisson_ratio: f64,
@@ -492,6 +493,10 @@ fn project_sand(
     friction_angle: f64,
     cohesion: f64,
 ) -> (Matrix3<f64>, PlasticState) {
+    let (lambda, mu) = lame(young, poisson);
+    if lambda == 0.0 {
+        return (deformation, plastic);
+    }
     let Some((u, singular, v_t)) = svd_parts(deformation) else {
         return (deformation, plastic);
     };
@@ -501,25 +506,28 @@ fn project_sand(
     let deviatoric = strain - Vector3::repeat(trace / 3.0);
     let norm = deviatoric.norm();
     let shifted_trace = trace - cohesion;
-    let sine = friction_angle.sin();
+    let q = plastic.hardening;
+    let angle =
+        friction_angle + (9.0f64.to_radians() * q - 10.0f64.to_radians()) * (-0.2 * q).exp();
+    let sine = angle.sin();
     let alpha = (2.0 / 3.0f64).sqrt() * (2.0 * sine) / (3.0 - sine);
-    let (lambda, mu) = lame(young, poisson);
-
-    let projected_log = if shifted_trace > 0.0 || norm <= 1e-12 {
-        Vector3::repeat(cohesion / 3.0)
+    // Keep isotropic classification stable across f32 GPU upload and SVD roundoff.
+    let (projected_log, increment) = if shifted_trace > 0.0 || norm <= 4.0 * f64::from(f32::EPSILON)
+    {
+        (Vector3::repeat(cohesion / 3.0), strain.norm())
     } else {
         let gamma = norm + (3.0 * lambda + 2.0 * mu) / (2.0 * mu) * shifted_trace * alpha;
         if gamma <= 0.0 {
             return (deformation, plastic);
         }
-        plastic.hardening += gamma;
-        strain - deviatoric * (gamma / norm)
+        (strain - deviatoric * (gamma / norm), gamma)
     };
     let projected = projected_log.map(f64::exp);
     let old_det = singular.iter().product::<f64>().max(1e-12);
     let new_det = projected.iter().product::<f64>().max(1e-12);
     plastic.plastic_det = (plastic.plastic_det * old_det / new_det).clamp(0.01, 100.0);
     plastic.log_volume_gain += old_det.ln() - new_det.ln();
+    plastic.hardening += increment;
     (u * Matrix3::from_diagonal(&projected) * v_t, plastic)
 }
 
@@ -535,6 +543,81 @@ mod sand_neo_hookean_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sand_hardening_accumulates_across_shear_and_apex_loads() {
+        for model in [
+            MaterialModel::sand(4_000.0, 0.2, 35.0f64.to_radians(), 0.0),
+            MaterialModel::sand_neo_hookean(4_000.0, 0.2, 35.0f64.to_radians(), 0.0),
+        ] {
+            let particle = crate::MpmParticle::new(Vector3::zeros(), 0.04, 1_000.0, model);
+            let mut state = particle.plastic;
+            assert_eq!(state.hardening, 1.0);
+            for load in [
+                Vector3::new(0.15, -0.25, -0.1),
+                Vector3::new(0.15, -0.25, -0.1),
+                Vector3::new(0.15, -0.25, -0.1),
+                Vector3::repeat(1.2f64.ln()),
+                Vector3::repeat(0.8f64.ln()),
+            ] {
+                let strain = load + Vector3::repeat(state.log_volume_gain / 3.0);
+                let trace = strain.sum();
+                let deviatoric = strain - Vector3::repeat(trace / 3.0);
+                let angle = 35.0f64.to_radians()
+                    + (9.0f64.to_radians() * state.hardening - 10.0f64.to_radians())
+                        * (-0.2 * state.hardening).exp();
+                let alpha = (2.0 / 3.0f64).sqrt() * 2.0 * angle.sin() / (3.0 - angle.sin());
+                let (expected_log, increment) = if trace > 0.0 || deviatoric.norm() < 1e-12 {
+                    (Vector3::zeros(), strain.norm())
+                } else {
+                    let gamma = deviatoric.norm() + 2.0 * trace * alpha;
+                    assert!(gamma > 0.0);
+                    (strain - deviatoric * (gamma / deviatoric.norm()), gamma)
+                };
+                let previous = state;
+                let (projected, next) =
+                    model.project_deformation(Matrix3::from_diagonal(&load.map(f64::exp)), state);
+                assert!(
+                    (projected - Matrix3::from_diagonal(&expected_log.map(f64::exp))).norm()
+                        < 1e-12
+                );
+                assert!((next.hardening - previous.hardening - increment).abs() < 1e-12);
+                let volume_change = load.sum() - expected_log.sum();
+                assert!(
+                    (next.plastic_det - previous.plastic_det * volume_change.exp()).abs() < 1e-12
+                );
+                assert!(
+                    (next.log_volume_gain - previous.log_volume_gain - volume_change).abs() < 1e-12
+                );
+                state = next;
+            }
+        }
+    }
+
+    #[test]
+    fn corotated_sand_isotropic_roundoff_and_disabled_plasticity_preserve_contracts() {
+        let rotation = nalgebra::UnitQuaternion::from_euler_angles(0.2, -0.4, 0.7)
+            .to_rotation_matrix()
+            .into_inner();
+        let material = MaterialModel::sand(4_000.0, 0.2, 35.0f64.to_radians(), 0.02);
+        let state = PlasticState {
+            hardening: 1.0,
+            ..PlasticState::default()
+        };
+        let (exact, exact_state) = material.project_deformation(rotation, state);
+        let (rounded, rounded_state) =
+            material.project_deformation(rotation.map(|x| f64::from(x as f32)), state);
+        assert!((exact - rounded).norm() < 2e-6);
+        assert!((exact_state.hardening - rounded_state.hardening).abs() < 2e-6);
+        assert!((exact_state.plastic_det - rounded_state.plastic_det).abs() < 2e-6);
+        assert!((exact_state.log_volume_gain - rounded_state.log_volume_gain).abs() < 2e-6);
+        let disabled = MaterialModel::sand(4_000.0, 0.0, 0.5, 0.0);
+        let tension = Matrix3::identity() * 1.2;
+        assert_eq!(
+            disabled.project_deformation(tension, state),
+            (tension, state)
+        );
+    }
 
     #[test]
     fn fluid_pressure_resists_compression_and_softly_resists_tension() {

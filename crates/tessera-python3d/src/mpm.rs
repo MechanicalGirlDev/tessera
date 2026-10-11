@@ -62,13 +62,13 @@ pub enum MpmMaterial {
         /// Poisson ratio.
         poisson_ratio: f64,
     },
-    /// Drucker-Prager granular material.
+    /// Corotated sand with hardening Drucker-Prager plasticity.
     Sand {
         /// Young's modulus in pascals.
         young_modulus: f64,
         /// Poisson ratio.
         poisson_ratio: f64,
-        /// Internal friction angle in radians.
+        /// Asymptotic friction angle in radians; use 35 degrees for Nexus defaults.
         friction_angle: f64,
         /// Tensile yield offset.
         cohesion: f64,
@@ -377,6 +377,8 @@ pub enum MpmBoundary {
     Separate,
     /// Project penetrated positions without changing velocity.
     NonReflecting,
+    /// Remove relative normal velocity in both directions without tangential friction.
+    FreeSlip,
 }
 
 impl From<MpmBoundary> for ObstacleBoundary {
@@ -386,6 +388,7 @@ impl From<MpmBoundary> for ObstacleBoundary {
             MpmBoundary::Stick => Self::Stick,
             MpmBoundary::Separate => Self::Separate,
             MpmBoundary::NonReflecting => Self::NonReflecting,
+            MpmBoundary::FreeSlip => Self::FreeSlip,
         }
     }
 }
@@ -397,6 +400,7 @@ impl From<ObstacleBoundary> for MpmBoundary {
             ObstacleBoundary::Stick => Self::Stick,
             ObstacleBoundary::Separate => Self::Separate,
             ObstacleBoundary::NonReflecting => Self::NonReflecting,
+            ObstacleBoundary::FreeSlip => Self::FreeSlip,
         }
     }
 }
@@ -525,6 +529,7 @@ impl MpmRigidSource {
 #[derive(Debug)]
 struct MpmInner {
     world: CoreMpmWorld,
+    frame_substeps: u32,
     chunks: BTreeMap<u64, ParticleChunkId>,
     gpu: Option<MpmGpu>,
     resident: Option<(f64, GpuMpmResidentSession<'static>)>,
@@ -532,6 +537,35 @@ struct MpmInner {
 }
 
 impl MpmInner {
+    fn set_configuration(&mut self, params: MpmParams, use_cpic: bool) -> Result<(), TesseraError> {
+        params.validate().map_err(failed)?;
+        self.reject_pending()?;
+        let mut updated = self.world.clone();
+        updated.params = params;
+        updated.use_cpic = use_cpic;
+        if let Some(gpu) = &self.gpu {
+            // Validate device representability and capacity before dropping any
+            // resident buffers. A changed CFL bound may require a smaller dt.
+            let _replacement = GpuMpmResidentSession::new(
+                &gpu.transfers,
+                &gpu.device,
+                &gpu.queue,
+                updated.clone(),
+                self.resident
+                    .as_ref()
+                    .map_or(updated.stable_timestep(), |(dt, _)| {
+                        dt.min(updated.stable_timestep())
+                    }),
+            )
+            .map_err(failed)?;
+        }
+        self.world = updated;
+        self.resident = None;
+        // Retain the source/settings cache. With no resident session, the next
+        // coupled call rebuilds its buffer bindings on the same device.
+        Ok(())
+    }
+
     fn pending_steps(&self) -> u64 {
         self.resident
             .as_ref()
@@ -636,6 +670,7 @@ impl MpmWorld {
         Ok(Arc::new(Self {
             inner: Mutex::new(MpmInner {
                 world,
+                frame_substeps: 1,
                 chunks,
                 gpu: None,
                 resident: None,
@@ -644,19 +679,106 @@ impl MpmWorld {
         }))
     }
 
+    /// Change gravity without resetting particles, forces, chunks, or obstacles.
+    /// Synchronize pending GPU work first.
+    pub fn set_gravity(&self, gravity: Vec3) -> Result<(), TesseraError> {
+        let mut inner = locked(&self.inner)?;
+        let mut params = inner.world.params.clone();
+        params.gravity = gravity.nalgebra();
+        let use_cpic = inner.world.use_cpic;
+        inner.set_configuration(params, use_cpic)
+    }
+
+    /// Read the current world-space gravitational acceleration.
+    pub fn gravity(&self) -> Result<Vec3, TesseraError> {
+        Ok(locked(&self.inner)?.world.params.gravity.into())
+    }
+
+    /// Replace integration parameters without resetting persistent state.
+    /// Supply both bounds corners, or neither to remove the bounds.
+    /// Resident GPU grids are rebuilt on the next fixed step.
+    pub fn set_params(
+        &self,
+        gravity: Vec3,
+        cell_width: f64,
+        max_substep: f64,
+        bounds_min: Option<Vec3>,
+        bounds_max: Option<Vec3>,
+    ) -> Result<(), TesseraError> {
+        let bounds = match (bounds_min, bounds_max) {
+            (None, None) => None,
+            (Some(min), Some(max)) => Some(WorldBounds {
+                min: min.nalgebra(),
+                max: max.nalgebra(),
+            }),
+            _ => return Err(failed("both MPM bounds corners must be supplied")),
+        };
+        let mut inner = locked(&self.inner)?;
+        let use_cpic = inner.world.use_cpic;
+        inner.set_configuration(
+            MpmParams {
+                gravity: gravity.nalgebra(),
+                cell_width,
+                max_substep,
+                bounds,
+            },
+            use_cpic,
+        )
+    }
+
+    /// Set the minimum number of subdivisions for `step` and `step_gpu`.
+    /// Like Nexus, zero selects one. CFL limits may add further subdivisions.
+    /// Explicit fixed GPU methods keep using their supplied timestep and count.
+    pub fn set_substeps(&self, substeps: u32) -> Result<(), TesseraError> {
+        let mut inner = locked(&self.inner)?;
+        inner.reject_pending()?;
+        inner.frame_substeps = substeps.max(1);
+        Ok(())
+    }
+
+    /// Read the configured frame subdivision count (initially one).
+    pub fn frame_substeps(&self) -> Result<u32, TesseraError> {
+        Ok(locked(&self.inner)?.frame_substeps)
+    }
+
+    /// Enable or disable obstacle CPIC coloring, preserving assigned groups.
+    /// Explicit particle transfer colors are unaffected.
+    pub fn set_use_cpic(&self, enabled: bool) -> Result<(), TesseraError> {
+        let mut inner = locked(&self.inner)?;
+        let params = inner.world.params.clone();
+        inner.set_configuration(params, enabled)
+    }
+
+    /// Whether obstacle CPIC coloring is enabled (initially true).
+    pub fn use_cpic(&self) -> Result<bool, TesseraError> {
+        Ok(locked(&self.inner)?.world.use_cpic)
+    }
+
     /// Advance with the deterministic CPU reference path.
     pub fn step(&self, dt: f64) -> Result<(), TesseraError> {
         let mut inner = locked(&self.inner)?;
         inner.reject_pending()?;
+        let substep_dt = dt / f64::from(inner.frame_substeps);
+        if !dt.is_finite() || substep_dt <= 0.0 {
+            return Err(failed("invalid MPM frame timestep"));
+        }
         inner.resident = None;
         inner.coupled = None;
-        inner.world.step(dt).map_err(failed)
+        for _ in 0..inner.frame_substeps {
+            inner.world.step(substep_dt).map_err(failed)?;
+        }
+        Ok(())
     }
 
     /// Advance with WebGPU transfers and automatic CFL substeps.
     pub fn step_gpu(&self, dt: f64) -> Result<(), TesseraError> {
         let mut inner = locked(&self.inner)?;
         inner.reject_pending()?;
+        let frame_substeps = inner.frame_substeps;
+        let substep_dt = dt / f64::from(frame_substeps);
+        if !dt.is_finite() || substep_dt <= 0.0 {
+            return Err(failed("invalid MPM frame timestep"));
+        }
         inner.resident = None;
         inner.coupled = None;
         if inner.gpu.is_none() {
@@ -666,9 +788,12 @@ impl MpmWorld {
         let gpu = gpu
             .as_ref()
             .ok_or_else(|| failed("GPU context unavailable"))?;
-        world
-            .step_with_gpu_transfers(&gpu.transfers, &gpu.device, &gpu.queue, dt)
-            .map_err(failed)
+        for _ in 0..frame_substeps {
+            world
+                .step_with_gpu_transfers(&gpu.transfers, &gpu.device, &gpu.queue, substep_dt)
+                .map_err(failed)?;
+        }
+        Ok(())
     }
 
     /// Advance fixed GPU substeps, reusing buffers while timestep and state agree.
@@ -1300,6 +1425,170 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_mpm_configuration_preserves_state_and_rejects_invalid_params() {
+        let world = MpmWorld::new(
+            vec![particle(0.5)],
+            v(0.0, 0.0, -1.0),
+            0.1,
+            0.001,
+            None,
+            None,
+        )
+        .unwrap();
+        let chunk = world.add_particles(vec![particle(0.7)]).unwrap();
+        world.step(0.0001).unwrap();
+        world.set_particle_force(0, v(1.0, 2.0, 3.0)).unwrap();
+        let before = locked(&world.inner).unwrap().world.clone();
+        world.set_gravity(v(1.0, 0.0, 0.0)).unwrap();
+        world
+            .set_params(
+                v(0.0, 2.0, 0.0),
+                0.2,
+                0.0005,
+                Some(v(0.0, 0.0, 0.0)),
+                Some(v(1.0, 1.0, 1.0)),
+            )
+            .unwrap();
+        {
+            let inner = locked(&world.inner).unwrap();
+            assert_eq!(inner.world.substeps, before.substeps);
+            for (actual, expected) in inner.world.particles.iter().zip(&before.particles) {
+                assert_eq!(actual.position, expected.position);
+                assert_eq!(actual.velocity, expected.velocity);
+                assert_eq!(actual.deformation, expected.deformation);
+                assert_eq!(actual.affine, expected.affine);
+                assert_eq!(actual.plastic, expected.plastic);
+                assert_eq!(actual.force, expected.force);
+                assert_eq!(actual.chunk_id(), expected.chunk_id());
+            }
+        }
+        assert_eq!(world.gravity().unwrap().y, 2.0);
+        for (cell_width, max_substep) in [
+            (0.0, 0.001),
+            (-0.1, 0.001),
+            (f64::NAN, 0.001),
+            (0.1, 0.0),
+            (0.1, f64::INFINITY),
+        ] {
+            assert!(
+                world
+                    .set_params(v(3.0, 0.0, 0.0), cell_width, max_substep, None, None)
+                    .is_err()
+            );
+        }
+        assert!(world.set_gravity(v(f64::NAN, 0.0, 0.0)).is_err());
+        assert!(
+            world
+                .set_params(v(3.0, 0.0, 0.0), 0.1, 0.001, Some(v(0.0, 0.0, 0.0)), None)
+                .is_err()
+        );
+        assert!(
+            world
+                .set_params(
+                    v(3.0, 0.0, 0.0),
+                    0.1,
+                    0.001,
+                    Some(v(1.0, 0.0, 0.0)),
+                    Some(v(0.0, 1.0, 1.0)),
+                )
+                .is_err()
+        );
+        let inner = locked(&world.inner).unwrap();
+        assert_eq!(inner.world.params.cell_width, 0.2);
+        assert_eq!(inner.world.params.max_substep, 0.0005);
+        assert_eq!(inner.world.params.gravity, v(0.0, 2.0, 0.0).nalgebra());
+        assert!(inner.world.params.bounds.is_some());
+        drop(inner);
+        assert_eq!(world.remove_chunk(chunk).unwrap(), 1);
+        assert!(world.add_particles(vec![particle(0.7)]).unwrap() > chunk);
+    }
+
+    #[test]
+    fn runtime_mpm_substeps_match_explicit_frame_division() {
+        let make_world = || {
+            MpmWorld::new(
+                vec![particle(0.5)],
+                v(0.0, 0.0, -1.0),
+                0.1,
+                0.001,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let configured = make_world();
+        let explicit = make_world();
+        assert_eq!(configured.frame_substeps().unwrap(), 1);
+        configured.set_substeps(0).unwrap();
+        assert_eq!(configured.frame_substeps().unwrap(), 1);
+        configured.set_substeps(4).unwrap();
+        configured.step(0.001).unwrap();
+        for _ in 0..4 {
+            explicit.step(0.00025).unwrap();
+        }
+        let a = locked(&configured.inner).unwrap();
+        let b = locked(&explicit.inner).unwrap();
+        assert_eq!(a.world.substeps, 4);
+        assert_eq!(a.world.particles[0].position, b.world.particles[0].position);
+        assert_eq!(a.world.particles[0].velocity, b.world.particles[0].velocity);
+        drop(a);
+        drop(b);
+        assert!(configured.step(f64::NAN).is_err());
+        assert!(configured.step(0.0).is_err());
+        assert_eq!(locked(&configured.inner).unwrap().world.substeps, 4);
+    }
+
+    #[test]
+    fn runtime_mpm_gpu_controls_preserve_pending_and_resident_state() {
+        if GpuContactDevice::new().is_err() {
+            eprintln!("No hardware WebGPU adapter available for runtime MPM test");
+            return;
+        }
+        let world = MpmWorld::new(
+            vec![particle(0.5)],
+            v(0.0, 0.0, -1.0),
+            0.1,
+            0.001,
+            None,
+            None,
+        )
+        .unwrap();
+        world.step_gpu_fixed(0.0001, 1).unwrap();
+        let before = world.particles().unwrap()[0].position;
+        assert!(world.set_gravity(v(f64::MAX, 0.0, 0.0)).is_err());
+        assert!(locked(&world.inner).unwrap().resident.is_some());
+        assert_eq!(world.gravity().unwrap().z, -1.0);
+        locked(&world.inner)
+            .unwrap()
+            .resident
+            .as_mut()
+            .unwrap()
+            .1
+            .submit_steps(1)
+            .unwrap();
+        assert!(world.set_gravity(v(0.0, 0.0, 1.0)).is_err());
+        assert!(world.set_substeps(4).is_err());
+        assert!(world.set_use_cpic(false).is_err());
+        assert_eq!(world.frame_substeps().unwrap(), 1);
+        assert!(world.use_cpic().unwrap());
+        assert_eq!(locked(&world.inner).unwrap().pending_steps(), 1);
+        world.synchronize_gpu().unwrap();
+        let synchronized = world.particles().unwrap()[0].position;
+        assert!(synchronized.z < before.z);
+        world.set_gravity(v(0.0, 0.0, 1.0)).unwrap();
+        assert!(locked(&world.inner).unwrap().resident.is_none());
+        assert_eq!(world.particles().unwrap()[0].position.z, synchronized.z);
+        world.set_use_cpic(false).unwrap();
+        world.step_gpu_fixed(0.0001, 1).unwrap();
+        let inner = locked(&world.inner).unwrap();
+        assert!(!inner.resident.as_ref().unwrap().1.world().use_cpic);
+        assert_eq!(
+            inner.resident.as_ref().unwrap().1.world().params.gravity.z,
+            1.0
+        );
+    }
+
+    #[test]
     fn python_sand_neo_hookean_preserves_model_parameters_and_plastic_state() {
         let material = MpmMaterial::SandNeoHookean {
             young_modulus: 4_000.0,
@@ -1453,6 +1742,16 @@ mod tests {
             .unwrap();
         world.set_obstacle_cpic_groups(vec![Some(0)]).unwrap();
         assert_eq!(world.obstacle_cpic_groups().unwrap(), vec![Some(0)]);
+        world.set_obstacle_cpic_groups(vec![Some(31)]).unwrap();
+        assert!(world.use_cpic().unwrap());
+        world.set_use_cpic(false).unwrap();
+        assert!(!world.use_cpic().unwrap());
+        assert_eq!(world.obstacle_cpic_groups().unwrap(), vec![Some(31)]);
+        world.set_obstacle_cpic_groups(vec![Some(7)]).unwrap();
+        world.set_particle_transfer_color(0, 2).unwrap();
+        world.set_use_cpic(true).unwrap();
+        assert_eq!(world.obstacle_cpic_groups().unwrap(), vec![Some(7)]);
+        assert_eq!(world.particles().unwrap()[0].transfer_color, 2);
         world.set_obstacle_cpic_groups(vec![Some(31)]).unwrap();
         assert!(world.set_obstacle_cpic_groups(vec![Some(32)]).is_err());
         assert!(world.set_obstacle_cpic_groups(vec![]).is_err());
