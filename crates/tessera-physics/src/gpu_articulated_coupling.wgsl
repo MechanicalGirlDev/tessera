@@ -24,6 +24,16 @@ struct Sphere {
 
 @group(0) @binding(3) var<storage, read> indices: array<u32>;
 
+struct ContactPolicy {
+    recovery: vec4<f32>,
+    dynamic_normal: vec4<f32>,
+    static_normal: vec4<f32>,
+    loop_constraint: vec4<f32>,
+    coupling_constraint: vec4<f32>,
+    fixed_loop_constraint: vec4<f32>,
+};
+@group(0) @binding(4) var<uniform> contact_policy: ContactPolicy;
+
 @compute @workgroup_size(64)
 fn prepare_couplings(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if (invocation.x >= arrayLength(&indices)) { return; }
@@ -40,11 +50,11 @@ fn prepare_couplings(@builtin(global_invocation_id) invocation: vec3<u32>) {
     let value = (((a4 * x + c.w) * x + c.z) * x + c.y) * x + c.x;
     let derivative = ((4.0 * a4 * x + 3.0 * c.w) * x + 2.0 * c.z) * x + c.y;
     let error = positions[offset + row.indices.x] - row.center_of_mass.x - value;
-    let target_speed = -row.material.x * error / row.material.y;
+    let target_speed = -contact_policy.coupling_constraint.x * error / row.material.y;
     if (!(abs(value) < 1e30) || !(abs(derivative) < 1e30) || !(abs(target_speed) < 1e30)) {
         atomicOr(&status[row.indices.w], 1u);
         return;
     }
     rows[index].plane = vec4<f32>(a4,
-        clamp(target_speed, -row.material.z, row.material.z), derivative, 0.0);
+        clamp(target_speed, -contact_policy.recovery.y, contact_policy.recovery.y), derivative, 0.0);
 }

@@ -51,6 +51,14 @@ pub struct GpuArticulatedLinkTermsBatch {
 }
 
 impl GpuArticulatedLinkTermsBatch {
+    pub(crate) fn metadata_buffer(&self) -> &wgpu::Buffer {
+        &self.metadata
+    }
+
+    pub(crate) const fn metadata_stride() -> usize {
+        size_of::<LinkMeta>()
+    }
+
     /// Bind packed articulations to an existing mass assembly batch.
     pub fn new(
         poses: &GpuArticulatedPoseBatch,
@@ -167,7 +175,9 @@ impl GpuArticulatedLinkTermsBatch {
         let metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera articulated link inertial metadata"),
             contents: bytemuck::cast_slice(&metadata),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Tessera articulated link Jacobians"),

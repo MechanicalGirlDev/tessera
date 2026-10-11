@@ -4,13 +4,24 @@ use nalgebra::Vector3;
 
 use crate::convex::{ConvexGeometry, ConvexGeometryError};
 
-/// Resolves one model mesh reference into one or more convex collision parts.
+/// Resolves model meshes into convex parts and, optionally, indexed surfaces.
 ///
 /// The resolver owns URI, filesystem, and file-format policy. Returned vertices
 /// must already include the requested non-uniform scale.
 pub trait ConvexMeshResolver {
     /// Resolve `filename` into validated convex parts.
     fn resolve(&mut self, filename: &str, scale: [f64; 3]) -> Result<Vec<ConvexGeometry>, String>;
+
+    /// Resolve `filename` into indexed surfaces, preserving holes and concavity.
+    /// Vertices must include `scale`, just as for convex parts. Convex-only
+    /// resolvers fail explicitly rather than silently building a hull.
+    fn resolve_indexed(
+        &mut self,
+        _filename: &str,
+        _scale: [f64; 3],
+    ) -> Result<Vec<TriangleMeshGeometry>, String> {
+        Err("indexed mesh resolution is not implemented by this resolver".into())
+    }
 }
 
 impl<F> ConvexMeshResolver for F

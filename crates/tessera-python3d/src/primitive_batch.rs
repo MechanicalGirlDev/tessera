@@ -5,6 +5,14 @@ use tessera_physics::gpu_rigid_sphere_world::{
     GpuRigidPrimitiveBatch as CoreGpuPrimitiveBatch, GpuRigidPrimitiveEnvironment,
 };
 
+#[path = "rigid_spherical.rs"]
+mod rigid_spherical;
+pub use rigid_spherical::GpuSphericalLimit;
+
+#[path = "runtime_parameters.rs"]
+mod runtime_parameters;
+pub use runtime_parameters::GpuSolveParameters;
+
 /// Mixed-primitive environments packed into one GPU state and solver dispatch.
 #[derive(Debug, uniffi::Object)]
 pub struct GpuPrimitiveBatch {

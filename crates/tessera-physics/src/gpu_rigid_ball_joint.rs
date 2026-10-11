@@ -8,6 +8,8 @@ use std::sync::mpsc;
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
+use crate::articulated_world::MotorModel;
+
 /// Local anchor points constrained to coincide in world space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuRigidBallJoint {
@@ -141,21 +143,18 @@ impl GpuRigidPrismaticJoint {
     }
 }
 
-/// Velocity drive on a revolute or prismatic joint's free axis.
+/// Velocity drive on a revolute, prismatic, or spherical joint axis.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuRigidAxisMotor {
-    /// Relative angular or linear velocity requested along the joint axis.
+    /// Relative angular/linear velocity, or spherical rotation-vector coordinate rate.
     pub target_velocity: f32,
-    /// Maximum torque or force magnitude.
+    /// Maximum physical torque or force magnitude; positive infinity is unbounded.
     pub max_force: f32,
 }
 
 impl GpuRigidAxisMotor {
     fn is_valid(self) -> bool {
-        self.target_velocity.is_finite()
-            && self.max_force.is_finite()
-            && self.max_force >= 0.0
-            && self.max_force <= f32::MAX.sqrt()
+        self.target_velocity.is_finite() && self.max_force >= 0.0
     }
 }
 
@@ -189,18 +188,25 @@ impl GpuRigidRevoluteLimit {
     }
 }
 
+/// Bounds on a component of the shortest relative quaternion rotation vector.
+///
+/// Spherical coordinates are expressed in body A's local frame, not Euler angles.
+pub type GpuRigidSphericalLimit = GpuRigidRevoluteLimit;
+
 /// Force-limited position and velocity target for a joint's free axis.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuRigidAxisServo {
-    /// Target relative angle in radians or displacement in meters.
+    /// Force-based gains or effective-mass-normalized acceleration gains.
+    pub model: MotorModel,
+    /// Target relative angle, spherical rotation-vector component, or displacement.
     pub position_target: f32,
-    /// Target relative angular or linear velocity.
+    /// Target relative angular/linear velocity, or spherical coordinate rate.
     pub velocity_target: f32,
-    /// Force or torque per unit position error.
+    /// Force/torque or acceleration per unit position error, according to `model`.
     pub stiffness: f32,
-    /// Force or torque per unit velocity error.
+    /// Force/torque or acceleration per unit velocity error, according to `model`.
     pub damping: f32,
-    /// Maximum force or torque magnitude.
+    /// Maximum physical force or torque magnitude; positive infinity is unbounded.
     pub max_force: f32,
 }
 
@@ -212,9 +218,7 @@ impl GpuRigidAxisServo {
             && self.stiffness >= 0.0
             && self.damping.is_finite()
             && self.damping >= 0.0
-            && self.max_force.is_finite()
             && self.max_force >= 0.0
-            && self.max_force <= f32::MAX.sqrt()
     }
 }
 
@@ -400,6 +404,9 @@ pub struct GpuRigidBallJointSolver {
     prismatic_motors: Vec<Option<GpuRigidAxisMotor>>,
     prismatic_servos: Vec<Option<GpuRigidAxisServo>>,
     prismatic_limits: Vec<Option<GpuRigidPrismaticLimit>>,
+    spherical_motors: Vec<[Option<GpuRigidAxisMotor>; 3]>,
+    spherical_servos: Vec<[Option<GpuRigidAxisServo>; 3]>,
+    spherical_limits: Vec<[Option<GpuRigidSphericalLimit>; 3]>,
     packed_joints: Vec<PackedJoint>,
     joint_buffer: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
@@ -506,6 +513,12 @@ impl GpuRigidBallJointSolver {
                 .checked_add(fixed_joints.len())
                 .and_then(|count| count.checked_add(revolute_joints.len()))
                 .and_then(|count| count.checked_add(prismatic_joints.len()))
+                .and_then(|count| {
+                    joints
+                        .len()
+                        .checked_mul(3)
+                        .and_then(|axes| count.checked_add(axes))
+                })
                 .is_none()
             || environment_ids.len() != body_count
             || u32::try_from(body_count).is_err()
@@ -541,6 +554,11 @@ impl GpuRigidBallJointSolver {
                 prismatic_joints
                     .iter()
                     .map(|joint| (joint.body_a, joint.body_b)),
+            )
+            .chain(
+                joints
+                    .iter()
+                    .flat_map(|joint| [(joint.body_a, joint.body_b); 3]),
             )
             .collect::<Vec<_>>();
         let mut parents = (0..body_count).collect::<Vec<_>>();
@@ -658,6 +676,17 @@ impl GpuRigidBallJointSolver {
                 frame_b: joint.local_rotation_b,
                 drive: [0.0; 4],
                 servo: [0.0; 4],
+            }))
+            .chain(joints.iter().flat_map(|joint| {
+                (0..3).map(move |axis| PackedJoint {
+                    bodies: [joint.body_a, joint.body_b, 4 + axis, 0],
+                    anchor_a: [0.0; 4],
+                    anchor_b: [0.0; 4],
+                    frame_a: [0.0, 0.0, 0.0, 1.0],
+                    frame_b: [0.0, 0.0, 0.0, 1.0],
+                    drive: [0.0; 4],
+                    servo: [0.0; 4],
+                })
             }))
             .collect::<Vec<_>>();
         let limits = device.limits();
@@ -867,6 +896,9 @@ impl GpuRigidBallJointSolver {
             prismatic_motors: vec![None; prismatic_joints.len()],
             prismatic_servos: vec![None; prismatic_joints.len()],
             prismatic_limits: vec![None; prismatic_joints.len()],
+            spherical_motors: vec![[None; 3]; joints.len()],
+            spherical_servos: vec![[None; 3]; joints.len()],
+            spherical_limits: vec![[None; 3]; joints.len()],
             packed_joints: packed,
             joint_buffer,
             pipeline,
@@ -945,6 +977,95 @@ impl GpuRigidBallJointSolver {
     /// Current displacement limits on a prismatic joint, if configured.
     pub fn prismatic_limit(&self, index: usize) -> Option<Option<GpuRigidPrismaticLimit>> {
         self.prismatic_limits.get(index).copied()
+    }
+
+    /// Current drive on a ball joint's rotation-vector axis (0 = X, 1 = Y, 2 = Z).
+    pub fn spherical_motor(&self, index: usize, axis: usize) -> Option<Option<GpuRigidAxisMotor>> {
+        self.spherical_motors.get(index)?.get(axis).copied()
+    }
+
+    /// Current position/velocity servo on a ball joint's rotation-vector axis.
+    pub fn spherical_servo(&self, index: usize, axis: usize) -> Option<Option<GpuRigidAxisServo>> {
+        self.spherical_servos.get(index)?.get(axis).copied()
+    }
+
+    /// Current shortest rotation-vector bounds on a ball joint axis.
+    pub fn spherical_limit(
+        &self,
+        index: usize,
+        axis: usize,
+    ) -> Option<Option<GpuRigidSphericalLimit>> {
+        self.spherical_limits.get(index)?.get(axis).copied()
+    }
+
+    /// Set the velocity drive for one spherical rotation-vector coordinate.
+    pub fn set_spherical_motor(
+        &mut self,
+        queue: &wgpu::Queue,
+        index: usize,
+        axis: usize,
+        motor: Option<GpuRigidAxisMotor>,
+    ) -> Result<(), GpuRigidBallJointError> {
+        if index >= self.joints.len() || axis >= 3 || motor.is_some_and(|value| !value.is_valid()) {
+            return Err(GpuRigidBallJointError::InvalidInput);
+        }
+        self.spherical_motors[index][axis] = motor;
+        if motor.is_some() {
+            self.spherical_servos[index][axis] = None;
+        }
+        self.refresh_spherical_settings(queue, index, axis);
+        Ok(())
+    }
+
+    /// Set the position/velocity servo for one spherical rotation-vector coordinate.
+    pub fn set_spherical_servo(
+        &mut self,
+        queue: &wgpu::Queue,
+        index: usize,
+        axis: usize,
+        servo: Option<GpuRigidAxisServo>,
+    ) -> Result<(), GpuRigidBallJointError> {
+        if index >= self.joints.len() || axis >= 3 || servo.is_some_and(|value| !value.is_valid()) {
+            return Err(GpuRigidBallJointError::InvalidInput);
+        }
+        self.spherical_servos[index][axis] = servo;
+        if servo.is_some() {
+            self.spherical_motors[index][axis] = None;
+        }
+        self.refresh_spherical_settings(queue, index, axis);
+        Ok(())
+    }
+
+    /// Set bounds on one shortest quaternion rotation-vector coordinate.
+    pub fn set_spherical_limit(
+        &mut self,
+        queue: &wgpu::Queue,
+        index: usize,
+        axis: usize,
+        limit: Option<GpuRigidSphericalLimit>,
+    ) -> Result<(), GpuRigidBallJointError> {
+        if index >= self.joints.len() || axis >= 3 || limit.is_some_and(|value| !value.is_valid()) {
+            return Err(GpuRigidBallJointError::InvalidInput);
+        }
+        self.spherical_limits[index][axis] = limit;
+        self.refresh_spherical_settings(queue, index, axis);
+        Ok(())
+    }
+
+    fn refresh_spherical_settings(&mut self, queue: &wgpu::Queue, index: usize, axis: usize) {
+        let packed_index = self.joints.len()
+            + self.fixed_joints.len()
+            + self.revolute_joints.len()
+            + self.prismatic_joints.len()
+            + 3 * index
+            + axis;
+        self.update_axis_settings(
+            queue,
+            packed_index,
+            self.spherical_motors[index][axis],
+            self.spherical_servos[index][axis],
+            self.spherical_limits[index][axis].map(|limit| (limit.min, limit.max)),
+        );
     }
 
     /// Change the velocity drive on one revolute joint.
@@ -1098,11 +1219,22 @@ impl GpuRigidBallJointSolver {
             limit.map_or(0.0, |limit| limit.0),
             limit.map_or(0.0, |limit| limit.1),
         ];
+        // Keep storage values finite: WGSL arithmetic is not required to
+        // preserve infinities. Negative caps are otherwise invalid publicly.
+        if packed.drive[1] == f32::INFINITY {
+            packed.drive[1] = -1.0;
+        }
         packed.servo = [
             servo.map_or(0.0, |servo| servo.position_target),
             servo.map_or(0.0, |servo| servo.stiffness),
             servo.map_or(0.0, |servo| servo.damping),
-            0.0,
+            servo.map_or(0.0, |servo| {
+                if servo.model == MotorModel::AccelerationBased {
+                    1.0
+                } else {
+                    0.0
+                }
+            }),
         ];
         queue.write_buffer(
             &self.joint_buffer,
@@ -1114,13 +1246,7 @@ impl GpuRigidBallJointSolver {
 
     /// Forget warm impulses while keeping continuous revolute angle history.
     pub fn clear_impulse_cache(&mut self, queue: &wgpu::Queue) {
-        let zeros = vec![
-            [0.0f32; 4];
-            self.joints.len()
-                + self.fixed_joints.len()
-                + self.revolute_joints.len()
-                + self.prismatic_joints.len()
-        ];
+        let zeros = vec![[0.0f32; 4]; self.packed_joints.len()];
         queue.write_buffer(&self.impulses, 0, bytemuck::cast_slice(&zeros));
         queue.write_buffer(&self.angular_impulses, 0, bytemuck::cast_slice(&zeros));
         self.last_dt_bits = None;
@@ -1158,24 +1284,9 @@ impl GpuRigidBallJointSolver {
     /// Forget impulses touching one replaced body.
     pub fn invalidate_body(&mut self, queue: &wgpu::Queue, body: usize) {
         let edges = self
-            .joints
+            .packed_joints
             .iter()
-            .map(|joint| (joint.body_a, joint.body_b))
-            .chain(
-                self.fixed_joints
-                    .iter()
-                    .map(|joint| (joint.body_a, joint.body_b)),
-            )
-            .chain(
-                self.revolute_joints
-                    .iter()
-                    .map(|joint| (joint.body_a, joint.body_b)),
-            )
-            .chain(
-                self.prismatic_joints
-                    .iter()
-                    .map(|joint| (joint.body_a, joint.body_b)),
-            );
+            .map(|joint| (joint.bodies[0], joint.bodies[1]));
         for (index, (body_a, body_b)) in edges.enumerate() {
             if body_a as usize == body || body_b as usize == body {
                 queue.write_buffer(

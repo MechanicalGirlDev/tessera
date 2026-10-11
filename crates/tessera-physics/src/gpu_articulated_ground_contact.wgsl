@@ -36,12 +36,48 @@ struct Pose {
 @group(0) @binding(5) var<storage, read> velocities: array<f32>;
 @group(0) @binding(6) var<storage, read_write> accelerations: array<f32>;
 @group(0) @binding(7) var<storage, read_write> state_status: array<atomic<u32>>;
-@group(0) @binding(8) var<uniform> contact_policy: vec4<f32>;
+struct ContactPolicy {
+    recovery: vec4<f32>,
+    dynamic_normal: vec4<f32>,
+    static_normal: vec4<f32>,
+    loop_constraint: vec4<f32>,
+    coupling_constraint: vec4<f32>,
+    fixed_loop_constraint: vec4<f32>,
+};
+@group(0) @binding(8) var<uniform> contact_policy: ContactPolicy;
 
-fn contact_recovery_velocity(distance: f32, dt: f32) -> f32 {
+fn normal_compliance(sphere: Sphere, system: System, normal: vec3<f32>,
+    first_offset: vec3<f32>, second_offset: vec3<f32>) -> vec2<f32> {
+    if (contact_owner_mode(sphere.material.w) != 3u) {
+        return contact_policy.static_normal.xy;
+    }
+    // Prescribed coordinates have Jacobians but zero inverse-mass response.
+    // Classify each body's normal row by J M^-1 J^T at the contact witness.
+    let n = system.indices.y;
+    var effective = vec2<f32>(0.0);
+    for (var row = 0u; row < n; row++) {
+        let j = vec2<f32>(
+            axis_jacobian(sphere.indices.y, n, row, normal, first_offset),
+            axis_jacobian(sphere.indices.w, n, row, normal, second_offset));
+        var response = vec2<f32>(0.0);
+        for (var column = 0u; column < n; column++) {
+            response += inverse[system.inverse.x + row * n + column] * vec2<f32>(
+                axis_jacobian(sphere.indices.y, n, column, normal, first_offset),
+                axis_jacobian(sphere.indices.w, n, column, normal, second_offset));
+        }
+        effective += j * response;
+    }
+    return select(contact_policy.static_normal.xy, contact_policy.dynamic_normal.xy,
+        all(effective > vec2<f32>(1e-12)));
+}
+
+fn contact_recovery_velocity(distance: f32, dt: f32, compliance: vec2<f32>) -> f32 {
+    // Default ERP preserves the legacy global gain; soft rows use ERP directly.
+    let gain = select(contact_policy.recovery.x * compliance.x / 0.2,
+        compliance.x, compliance.y > 0.0);
     return min(
-        contact_policy.x * max(-distance - contact_policy.w, 0.0) / dt,
-        contact_policy.y);
+        gain * max(-distance - contact_policy.recovery.w, 0.0) / dt,
+        contact_policy.recovery.y);
 }
 
 fn quat_rotate(q: vec4<f32>, value: vec3<f32>) -> vec3<f32> {
@@ -2969,7 +3005,7 @@ fn apply_cached_impulse(
 
 // Solve both normal impulses together after the second scalar row. This keeps
 // closely spaced supporting contacts balanced even with a small sweep count.
-fn resolve_capsule_face_normal_block(system: System, index: u32, second: Sphere,
+fn resolve_capsule_face_normal_block(environment: u32, system: System, index: u32, second: Sphere,
     second_normal: vec3<f32>, second_offset: vec3<f32>, second_other_offset: vec3<f32>,
     second_target: f32, second_impulse: f32) -> f32 {
     if (index == 0u) { return second_impulse; }
@@ -3022,19 +3058,29 @@ fn resolve_capsule_face_normal_block(system: System, index: u32, second: Sphere,
         k12 += j1 * r2;
         k22 += j2 * r2;
     }
+    let physical_k11 = k11;
+    let physical_k22 = k22;
+    let first_compliance = normal_compliance(first, system, first_normal, first_offset, first_other_offset);
+    let second_compliance = normal_compliance(second, system, second_normal, second_offset, second_other_offset);
+    k11 += first_compliance.y / dt;
+    k22 += second_compliance.y / dt;
     let determinant = k11 * k22 - k12 * k12;
     let trace = k11 + k22;
+    if (!(abs(determinant) < 1e30) || !(trace < 1e30)) {
+        atomicOr(&state_status[environment], 1u);
+        return second_impulse;
+    }
     if (!(determinant > 1e-6 * trace * trace) || !(trace < 1e30)) { return second_impulse; }
     var first_target_velocity = -first.diagnostic_first.w / dt;
     if (first.diagnostic_first.w < 0.0) {
-        first_target_velocity = contact_recovery_velocity(first.diagnostic_first.w, dt);
+        first_target_velocity = contact_recovery_velocity(first.diagnostic_first.w, dt, first_compliance);
     }
     if (first.material.x > 0.0 && first.diagnostic_first.w <= 0.0) {
         first_target_velocity = max(first_target_velocity, -first.material.x * min(incoming, 0.0));
     }
     let old = vec2<f32>(first.impulses.x, second_impulse);
     let rhs = vec2<f32>(first_target_velocity, second_target) - speed
-        + vec2<f32>(k11 * old.x + k12 * old.y, k12 * old.x + k22 * old.y);
+        + vec2<f32>(physical_k11 * old.x + k12 * old.y, k12 * old.x + physical_k22 * old.y);
     var solved = vec2<f32>((k22 * rhs.x - k12 * rhs.y) / determinant,
         (k11 * rhs.y - k12 * rhs.x) / determinant);
     // Enumerate the four active sets of the two-contact complementarity problem.
@@ -3046,7 +3092,10 @@ fn resolve_capsule_face_normal_block(system: System, index: u32, second: Sphere,
         else if (all(rhs <= vec2<f32>(0.0))) { solved = vec2<f32>(0.0); }
         else { return second_impulse; }
     }
-    if (!all(abs(solved) < vec2<f32>(1e30))) { return second_impulse; }
+    if (!all(abs(solved) < vec2<f32>(1e30))) {
+        atomicOr(&state_status[environment], 1u);
+        return second_impulse;
+    }
     let delta = solved - old;
     let reference = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(first_normal.z) >= 0.9);
     let tangent_one = normalize(cross(first_normal, reference));
@@ -3249,6 +3298,11 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
         let index = system.indices.z + row;
         spheres[index].diagnostic_first_origin = vec4<f32>(0.0);
         spheres[index].diagnostic_second_origin = vec4<f32>(0.0);
+        if (spheres[index].material.w == 78.0
+            || spheres[index].material.w == 79.0 || spheres[index].material.w == 80.0) {
+            // Bilateral rows are cold-started per substep, accumulated across sweeps.
+            spheres[index].impulses = vec4<f32>(0.0);
+        }
     }
     if (system.inverse.w == 0u) {
         for (var contact = 0u; contact < system.indices.w; contact++) {
@@ -3291,7 +3345,11 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
             }
             let axis_error = dot(sphere.plane.xyz, error);
             let dt = sphere.material.y;
-            let target_speed = clamp(-sphere.material.x * axis_error / dt,
+            let compliance = select(contact_policy.loop_constraint.xy,
+                contact_policy.fixed_loop_constraint.xy,
+                sphere.material.w == 80.0 || sphere.material.x == 1.0);
+            let gamma = compliance.y / dt;
+            let target_speed = clamp(-compliance.x * axis_error / dt,
                 -sphere.material.z, sphere.material.z);
             var prescribed_speed = 0.0;
             if (sphere.indices.z == 0xffffffffu) {
@@ -3315,14 +3373,15 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
             if (!(effective < 1e30) || !(abs(target_speed) < 1e30)) {
                 atomicOr(&state_status[environment], 1u); return;
             }
-            if (effective <= 1e-12) {
+            if (effective <= 1e-12 && gamma == 0.0) {
                 if (abs(axis_error) > 1e-6
                     || abs(prescribed_speed - relative_velocity) > 1e-6) {
                     atomicOr(&state_status[environment], 1u); return;
                 }
                 continue;
             }
-            let impulse = (target_speed + prescribed_speed - relative_velocity) / effective;
+            let impulse = (target_speed + prescribed_speed - relative_velocity
+                - gamma * sphere.impulses.x) / (effective + gamma);
             if (!(abs(impulse) < 1e30)) { atomicOr(&state_status[environment], 1u); return; }
             for (var row = 0u; row < n; row++) {
                 var response = 0.0;
@@ -3331,7 +3390,11 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
                         * link_constraint_jacobian(sphere, n, column, first_offset, second_offset);
                 }
                 accelerations[coordinate_offset + row] += response * impulse / dt;
+                if (!(abs(accelerations[coordinate_offset + row]) < 1e30)) {
+                    atomicOr(&state_status[environment], 1u); return;
+                }
             }
+            spheres[sphere_index].impulses.x = sphere.impulses.x + impulse;
             continue;
         }
         if (sphere.material.w == 78.0) {
@@ -3349,8 +3412,13 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
                     - derivative * (inverse[system.inverse.x + follower * n + source]
                         + inverse[system.inverse.x + source * n + follower]);
             }
-            if (!(effective > 1e-8) || !(effective < 1e30)) { continue; }
-            let impulse = (sphere.plane.y - relative_velocity) / effective;
+            let gamma = contact_policy.coupling_constraint.y / dt;
+            if (!(effective < 1e30) || !(abs(relative_velocity) < 1e30)) {
+                atomicOr(&state_status[environment], 1u); return;
+            }
+            if (effective <= 1e-12 && gamma == 0.0) { continue; }
+            let impulse = (sphere.plane.y - relative_velocity - gamma * sphere.impulses.x)
+                / (effective + gamma);
             if (!(abs(impulse) < 1e30)) {
                 atomicOr(&state_status[environment], 1u);
                 return;
@@ -3361,7 +3429,11 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
                     response -= derivative * inverse[system.inverse.x + row * n + source];
                 }
                 accelerations[coordinate_offset + row] += response * impulse / dt;
+                if (!(abs(accelerations[coordinate_offset + row]) < 1e30)) {
+                    atomicOr(&state_status[environment], 1u); return;
+                }
             }
+            spheres[sphere_index].impulses.x = sphere.impulses.x + impulse;
             continue;
         }
         if (sphere.material.w == 11.0) {
@@ -4187,7 +4259,7 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
                 && dot(sphere.previous_normal.xyz, normal) > 0.999
                 && (distance < 0.0 || distance + dt * normal_velocity < 0.0)
                 && all(abs(previous_impulses) < vec3<f32>(1e30))) {
-                previous_impulses *= contact_policy.z;
+                previous_impulses *= contact_policy.recovery.z;
                 apply_cached_impulse(system, sphere, normal, tangent_one, tangent_two,
                     contact_offset, second_offset, previous_impulses);
                 normal_velocity = prescribed_normal;
@@ -4217,7 +4289,12 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
             }
             effective += jacobian_row * response;
         }
-        if (!(effective > 1e-8) || !(effective < 1e30)) { continue; }
+        if (!(effective < 1e30) || !(abs(normal_velocity) < 1e30)) {
+            atomicOr(&state_status[environment], 1u); return;
+        }
+        if (!(effective > 1e-8)) { continue; }
+        let compliance = normal_compliance(sphere, system, normal, contact_offset, second_offset);
+        let gamma = compliance.y / dt;
         var correction_distance = distance;
         if ((sphere.material.w >= 52.0 && sphere.material.w <= 57.0)
             || (sphere.material.w >= 72.0 && sphere.material.w <= 77.0)) {
@@ -4227,16 +4304,19 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
         }
         var target_velocity = -correction_distance / dt;
         if (distance < 0.0) {
-            target_velocity = contact_recovery_velocity(correction_distance, dt);
+            target_velocity = contact_recovery_velocity(correction_distance, dt, compliance);
         }
         if (sphere.material.x > 0.0 && distance <= 0.0) {
             target_velocity = max(target_velocity,
                 -sphere.material.x * min(incoming_velocity, 0.0));
         }
         var normal_impulse = max(previous_impulses.x
-            + (target_velocity - normal_velocity) / effective, 0.0);
+            + (target_velocity - normal_velocity - gamma * previous_impulses.x)
+                / (effective + gamma), 0.0);
         let impulse = normal_impulse - previous_impulses.x;
-        if (!(abs(impulse) < 1e30)) { continue; }
+        if (!(abs(impulse) < 1e30)) {
+            atomicOr(&state_status[environment], 1u); return;
+        }
         for (var row = 0u; row < n; row++) {
             var response = 0.0;
             for (var column = 0u; column < n; column++) {
@@ -4244,9 +4324,12 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
                     * contact_jacobian(sphere, n, column, normal, contact_offset, second_offset);
             }
             accelerations[coordinate_offset + row] += response * impulse / dt;
+            if (!(abs(accelerations[coordinate_offset + row]) < 1e30)) {
+                atomicOr(&state_status[environment], 1u); return;
+            }
         }
         if (sphere.material.w == 81.0 || sphere.material.w == 82.0 || sphere.material.w == 83.0) {
-            normal_impulse = resolve_capsule_face_normal_block(system, sphere_index, spheres[sphere_index],
+            normal_impulse = resolve_capsule_face_normal_block(environment, system, sphere_index, spheres[sphere_index],
                 normal, contact_offset, second_offset, target_velocity, normal_impulse);
         }
         spheres[sphere_index].impulses = vec4<f32>(normal_impulse,
@@ -4315,6 +4398,11 @@ fn resolve_ground_contacts(@builtin(global_invocation_id) invocation: vec3<u32>)
         }
         spheres[sphere_index].impulses = vec4<f32>(normal_impulse, tangent_impulse.x,
             tangent_impulse.y, 0.0);
+    }
+    for (var row = 0u; row < n; row++) {
+        if (!(abs(accelerations[coordinate_offset + row]) < 1e30)) {
+            atomicOr(&state_status[environment], 1u); return;
+        }
     }
     }
 }

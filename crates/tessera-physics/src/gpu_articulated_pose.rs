@@ -75,6 +75,8 @@ pub struct GpuArticulatedPoseBatch {
     link_ranges: Vec<Range<usize>>,
     floating_roots: Vec<bool>,
     quaternion_spherical: bool,
+    reset_topology: Vec<(usize, Vec<[u32; 4]>)>,
+    joint_ranges: Vec<Range<usize>>,
 }
 
 impl GpuArticulatedPoseBatch {
@@ -151,6 +153,8 @@ impl GpuArticulatedPoseBatch {
         let mut roots = Vec::with_capacity(articulations.len());
         let mut link_ranges = Vec::with_capacity(articulations.len());
         let mut link_count = 0usize;
+        let mut reset_topology = Vec::with_capacity(articulations.len());
+        let mut joint_ranges = Vec::with_capacity(articulations.len());
         for (environment, (((articulation, root_pose), coordinates), &floating)) in articulations
             .iter()
             .zip(root_poses)
@@ -238,6 +242,14 @@ impl GpuArticulatedPoseBatch {
                     spherical: [spherical_index, 0, 0, 0],
                 });
             }
+            reset_topology.push((
+                root,
+                joints[joint_start..]
+                    .iter()
+                    .map(|joint| joint.indices)
+                    .collect(),
+            ));
+            joint_ranges.push(joint_start..joints.len());
             environments.push(GpuEnvironment {
                 indices: [
                     checked_u32(link_start)?,
@@ -278,7 +290,9 @@ impl GpuArticulatedPoseBatch {
         let joints = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera GPU articulation joints"),
             contents: bytemuck::cast_slice(&joints),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
         });
         let environments = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera GPU articulation layouts"),
@@ -333,7 +347,21 @@ impl GpuArticulatedPoseBatch {
             link_ranges,
             floating_roots: floating_roots.to_vec(),
             quaternion_spherical: spherical.is_some(),
+            reset_topology,
+            joint_ranges,
         })
+    }
+
+    pub(crate) fn reset_topology(&self) -> &[(usize, Vec<[u32; 4]>)] {
+        &self.reset_topology
+    }
+
+    pub(crate) fn joint_ranges(&self) -> &[Range<usize>] {
+        &self.joint_ranges
+    }
+
+    pub(crate) const fn joint_stride() -> usize {
+        size_of::<GpuJoint>()
     }
 
     /// Encode forward kinematics after any queued coordinate updates.

@@ -107,6 +107,20 @@ impl SphereWorld {
         &self.params
     }
 
+    /// Update gravity while preserving body state and waking resting bodies.
+    pub fn set_gravity(&mut self, gravity: [f64; 3]) -> Result<(), SphereWorldError> {
+        if gravity.iter().any(|value| !value.is_finite()) {
+            return Err(SphereWorldError::InvalidInput);
+        }
+        if gravity != self.params.gravity {
+            self.params.gravity = gravity;
+            for state in &mut self.sleep_states {
+                state.wake();
+            }
+        }
+        Ok(())
+    }
+
     /// Construct a world after validating every parameter and body.
     pub fn new(
         bodies: Vec<SphereBody>,

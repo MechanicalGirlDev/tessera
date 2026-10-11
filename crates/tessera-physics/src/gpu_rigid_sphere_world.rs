@@ -13,7 +13,8 @@ use crate::gpu_lbvh::{GpuLbvh, GpuLbvhResidentPairs};
 use crate::gpu_rigid_ball_joint::{
     GpuRigidAxisMotor, GpuRigidAxisServo, GpuRigidBallJoint, GpuRigidBallJointError,
     GpuRigidBallJointSolver, GpuRigidFixedJoint, GpuRigidPrismaticJoint, GpuRigidPrismaticLimit,
-    GpuRigidRevoluteJoint, GpuRigidRevoluteLimit, GpuRigidTemporalJointParams,
+    GpuRigidRevoluteJoint, GpuRigidRevoluteLimit, GpuRigidSphericalLimit,
+    GpuRigidTemporalJointParams,
 };
 use crate::gpu_rigid_contact_transport::{GpuRigidContactTransport, GpuRigidContactTransportError};
 use crate::gpu_rigid_shape::GpuRigidShape;
@@ -498,6 +499,103 @@ impl GpuRigidSphereWorld {
             .map_or(&[], GpuRigidBallJointSolver::prismatic_joints)
     }
 
+    /// Number of spherical joints, indexed in ball-joint insertion order.
+    pub fn spherical_joint_count(&self) -> usize {
+        self.ball_joints().len()
+    }
+
+    /// Number of independently configurable spherical axes.
+    pub fn spherical_axis_count(&self) -> usize {
+        3 * self.spherical_joint_count()
+    }
+
+    /// Velocity motor for ball joint `index`, body-A-local X/Y/Z axis `0/1/2`.
+    pub fn spherical_motor(
+        &self,
+        index: usize,
+        axis: usize,
+    ) -> Result<Option<GpuRigidAxisMotor>, GpuRigidSphereWorldError> {
+        self.ball_joints
+            .as_ref()
+            .and_then(|solver| solver.spherical_motor(index, axis))
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)
+    }
+
+    /// Set or clear one spherical axis velocity motor atomically.
+    pub fn set_spherical_motor(
+        &mut self,
+        index: usize,
+        axis: usize,
+        motor: Option<GpuRigidAxisMotor>,
+    ) -> Result<(), GpuRigidSphereWorldError> {
+        if self.faulted {
+            return Err(GpuRigidSphereWorldError::Faulted);
+        }
+        self.ball_joints
+            .as_mut()
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)?
+            .set_spherical_motor(&self.queue, index, axis, motor)?;
+        Ok(())
+    }
+
+    /// Position/velocity servo for ball joint `index`, rotation-vector axis `0/1/2`.
+    pub fn spherical_servo(
+        &self,
+        index: usize,
+        axis: usize,
+    ) -> Result<Option<GpuRigidAxisServo>, GpuRigidSphereWorldError> {
+        self.ball_joints
+            .as_ref()
+            .and_then(|solver| solver.spherical_servo(index, axis))
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)
+    }
+
+    /// Set or clear one spherical axis servo atomically.
+    pub fn set_spherical_servo(
+        &mut self,
+        index: usize,
+        axis: usize,
+        servo: Option<GpuRigidAxisServo>,
+    ) -> Result<(), GpuRigidSphereWorldError> {
+        if self.faulted {
+            return Err(GpuRigidSphereWorldError::Faulted);
+        }
+        self.ball_joints
+            .as_mut()
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)?
+            .set_spherical_servo(&self.queue, index, axis, servo)?;
+        Ok(())
+    }
+
+    /// Shortest quaternion rotation-vector bounds for one spherical axis.
+    pub fn spherical_limit(
+        &self,
+        index: usize,
+        axis: usize,
+    ) -> Result<Option<GpuRigidSphericalLimit>, GpuRigidSphereWorldError> {
+        self.ball_joints
+            .as_ref()
+            .and_then(|solver| solver.spherical_limit(index, axis))
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)
+    }
+
+    /// Set or clear one spherical axis limit atomically.
+    pub fn set_spherical_limit(
+        &mut self,
+        index: usize,
+        axis: usize,
+        limit: Option<GpuRigidSphericalLimit>,
+    ) -> Result<(), GpuRigidSphereWorldError> {
+        if self.faulted {
+            return Err(GpuRigidSphereWorldError::Faulted);
+        }
+        self.ball_joints
+            .as_mut()
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)?
+            .set_spherical_limit(&self.queue, index, axis, limit)?;
+        Ok(())
+    }
+
     /// Current velocity motor on a revolute joint.
     pub fn revolute_motor(
         &self,
@@ -767,6 +865,37 @@ impl GpuRigidSphereWorld {
             )?)
         };
         if let (Some(previous), Some(next_solver)) = (&self.ball_joints, &mut next) {
+            let mut used_ball = vec![false; previous.joints().len()];
+            for (index, joint) in ball_joints.iter().enumerate() {
+                if let Some(old_index) = previous
+                    .joints()
+                    .iter()
+                    .enumerate()
+                    .position(|(old_index, old)| !used_ball[old_index] && old == joint)
+                {
+                    used_ball[old_index] = true;
+                    for axis in 0..3 {
+                        next_solver.set_spherical_motor(
+                            &self.queue,
+                            index,
+                            axis,
+                            previous.spherical_motor(old_index, axis).flatten(),
+                        )?;
+                        next_solver.set_spherical_servo(
+                            &self.queue,
+                            index,
+                            axis,
+                            previous.spherical_servo(old_index, axis).flatten(),
+                        )?;
+                        next_solver.set_spherical_limit(
+                            &self.queue,
+                            index,
+                            axis,
+                            previous.spherical_limit(old_index, axis).flatten(),
+                        )?;
+                    }
+                }
+            }
             let mut angle_encoder =
                 self.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -853,6 +982,19 @@ impl GpuRigidSphereWorld {
         };
         if !next.is_valid() {
             return Err(GpuRigidSphereWorldError::InvalidInput);
+        }
+        if gravity != self.config.gravity && !self.faulted {
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            self.contacts.encode_sleep(
+                &self.device,
+                &mut encoder,
+                0.01,
+                SleepSettings {
+                    enabled: false,
+                    ..self.config.sleep
+                },
+            )?;
+            let _submission = self.queue.submit([encoder.finish()]);
         }
         self.config = next;
         self.impulse_cache.clear();
@@ -1532,13 +1674,17 @@ impl GpuRigidSphereWorld {
         let ball_joints = previous
             .joints()
             .iter()
-            .filter_map(|joint| {
+            .enumerate()
+            .filter_map(|(old_index, joint)| {
                 let (body_a, body_b) = remap_joint_bodies(edit, joint.body_a, joint.body_b)?;
-                Some(GpuRigidBallJoint {
-                    body_a,
-                    body_b,
-                    ..*joint
-                })
+                Some((
+                    old_index,
+                    GpuRigidBallJoint {
+                        body_a,
+                        body_b,
+                        ..*joint
+                    },
+                ))
             })
             .collect::<Vec<_>>();
         let fixed_joints = previous
@@ -1586,7 +1732,10 @@ impl GpuRigidSphereWorld {
             })
             .collect::<Vec<_>>();
         next.set_all_joints_with_prismatic(
-            &ball_joints,
+            &ball_joints
+                .iter()
+                .map(|(_, joint)| *joint)
+                .collect::<Vec<_>>(),
             &fixed_joints,
             &revolute.iter().map(|(_, joint)| *joint).collect::<Vec<_>>(),
             &prismatic
@@ -1597,6 +1746,28 @@ impl GpuRigidSphereWorld {
         let Some(next_solver) = next.ball_joints.as_mut() else {
             return Ok(());
         };
+        for (index, (old_index, _)) in ball_joints.iter().enumerate() {
+            for axis in 0..3 {
+                next_solver.set_spherical_motor(
+                    &self.queue,
+                    index,
+                    axis,
+                    previous.spherical_motor(*old_index, axis).flatten(),
+                )?;
+                next_solver.set_spherical_servo(
+                    &self.queue,
+                    index,
+                    axis,
+                    previous.spherical_servo(*old_index, axis).flatten(),
+                )?;
+                next_solver.set_spherical_limit(
+                    &self.queue,
+                    index,
+                    axis,
+                    previous.spherical_limit(*old_index, axis).flatten(),
+                )?;
+            }
+        }
         let mut angle_encoder =
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3546,6 +3717,120 @@ impl GpuRigidSphereBatch {
                 ..*joint
             })
             .collect())
+    }
+
+    /// Map an environment-local ball-joint index to the packed world index.
+    pub fn spherical_joint_index_environment(
+        &self,
+        environment: usize,
+        index: usize,
+    ) -> Result<usize, GpuRigidSphereWorldError> {
+        let range = self
+            .ranges
+            .get(environment)
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)?;
+        self.world
+            .ball_joints()
+            .iter()
+            .enumerate()
+            .filter(|(_, joint)| range.contains(&(joint.body_a as usize)))
+            .nth(index)
+            .map(|(index, _)| index)
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)
+    }
+
+    /// Number of ball joints in one environment's insertion order.
+    pub fn spherical_joint_count_environment(
+        &self,
+        environment: usize,
+    ) -> Result<usize, GpuRigidSphereWorldError> {
+        let range = self
+            .ranges
+            .get(environment)
+            .ok_or(GpuRigidSphereWorldError::InvalidInput)?;
+        Ok(self
+            .world
+            .ball_joints()
+            .iter()
+            .filter(|joint| range.contains(&(joint.body_a as usize)))
+            .count())
+    }
+
+    /// Number of spherical axes in one environment.
+    pub fn spherical_axis_count_environment(
+        &self,
+        environment: usize,
+    ) -> Result<usize, GpuRigidSphereWorldError> {
+        Ok(3 * self.spherical_joint_count_environment(environment)?)
+    }
+
+    /// Read a motor by environment-local ball-joint index and X/Y/Z axis.
+    pub fn spherical_motor_environment(
+        &self,
+        environment: usize,
+        index: usize,
+        axis: usize,
+    ) -> Result<Option<GpuRigidAxisMotor>, GpuRigidSphereWorldError> {
+        let index = self.spherical_joint_index_environment(environment, index)?;
+        self.world.spherical_motor(index, axis)
+    }
+
+    /// Set a motor by environment-local ball-joint index and X/Y/Z axis.
+    pub fn set_spherical_motor_environment(
+        &mut self,
+        environment: usize,
+        index: usize,
+        axis: usize,
+        motor: Option<GpuRigidAxisMotor>,
+    ) -> Result<(), GpuRigidSphereWorldError> {
+        let index = self.spherical_joint_index_environment(environment, index)?;
+        self.world.set_spherical_motor(index, axis, motor)
+    }
+
+    /// Read a servo by environment-local ball-joint index and X/Y/Z axis.
+    pub fn spherical_servo_environment(
+        &self,
+        environment: usize,
+        index: usize,
+        axis: usize,
+    ) -> Result<Option<GpuRigidAxisServo>, GpuRigidSphereWorldError> {
+        let index = self.spherical_joint_index_environment(environment, index)?;
+        self.world.spherical_servo(index, axis)
+    }
+
+    /// Set a servo by environment-local ball-joint index and X/Y/Z axis.
+    pub fn set_spherical_servo_environment(
+        &mut self,
+        environment: usize,
+        index: usize,
+        axis: usize,
+        servo: Option<GpuRigidAxisServo>,
+    ) -> Result<(), GpuRigidSphereWorldError> {
+        let index = self.spherical_joint_index_environment(environment, index)?;
+        self.world.set_spherical_servo(index, axis, servo)
+    }
+
+    /// Read bounds by environment-local ball-joint index and X/Y/Z axis.
+    pub fn spherical_limit_environment(
+        &self,
+        environment: usize,
+        index: usize,
+        axis: usize,
+    ) -> Result<Option<GpuRigidSphericalLimit>, GpuRigidSphereWorldError> {
+        let index = self.spherical_joint_index_environment(environment, index)?;
+        self.world.spherical_limit(index, axis)
+    }
+
+    /// Set bounds by environment-local ball-joint index and X/Y/Z axis.
+    pub fn set_spherical_limit_environment(
+        &mut self,
+        environment: usize,
+        index: usize,
+        axis: usize,
+        limit: Option<GpuRigidSphericalLimit>,
+    ) -> Result<(), GpuRigidSphereWorldError> {
+        let index = self.spherical_joint_index_environment(environment, index)?;
+        self.world.set_spherical_limit(index, axis, limit)
     }
 
     fn axis_joint_index(
@@ -7730,6 +8015,7 @@ mod tests {
             .set_prismatic_joints_environment(3, &[prismatic])
             .unwrap();
         let servo = GpuRigidAxisServo {
+            model: crate::articulated_world::MotorModel::ForceBased,
             position_target: 0.2,
             velocity_target: 0.1,
             stiffness: 2.0,
@@ -9141,6 +9427,7 @@ mod tests {
         let angle = 2.0 * state.orientation[2].atan2(state.orientation[3]);
         assert!(angle > 0.15 && angle < 0.35, "{state:?}");
         let servo = GpuRigidAxisServo {
+            model: crate::articulated_world::MotorModel::ForceBased,
             position_target: 0.1,
             velocity_target: 0.0,
             stiffness: 30.0,
@@ -9243,6 +9530,7 @@ mod tests {
         world.set_ball_joints(&[]).unwrap();
         assert!((world.readback_revolute_angle(0).unwrap() - limited).abs() < 1e-4);
         let servo = GpuRigidAxisServo {
+            model: crate::articulated_world::MotorModel::ForceBased,
             position_target: 4.0,
             velocity_target: 0.0,
             stiffness: 30.0,
@@ -9388,6 +9676,7 @@ mod tests {
             }])
             .unwrap();
         let servo = GpuRigidAxisServo {
+            model: crate::articulated_world::MotorModel::ForceBased,
             position_target: 0.4,
             velocity_target: 0.0,
             stiffness: 20.0,
@@ -9521,6 +9810,7 @@ mod tests {
         );
         assert_eq!(batch.prismatic_motor_environment(1, 0).unwrap(), None);
         let servo = GpuRigidAxisServo {
+            model: crate::articulated_world::MotorModel::ForceBased,
             position_target: 0.1,
             velocity_target: 0.0,
             stiffness: 10.0,
@@ -9892,6 +10182,7 @@ mod tests {
             max: 0.5,
         };
         let servo = GpuRigidAxisServo {
+            model: crate::articulated_world::MotorModel::ForceBased,
             position_target: 0.1,
             velocity_target: 0.0,
             stiffness: 10.0,

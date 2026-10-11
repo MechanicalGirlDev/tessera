@@ -209,6 +209,8 @@ pub struct Articulation {
     coordinate_limits: Vec<Option<(f64, f64)>>,
     dof: usize,
     collision_exclusions: BTreeSet<(usize, usize)>,
+    joint_collision_exclusions: BTreeSet<(usize, usize)>,
+    joint_contacts_enabled: bool,
 }
 
 /// Stable link and generalized slots for one independent free rigid body.
@@ -707,7 +709,7 @@ impl Articulation {
         if visited.iter().any(|seen| !seen) {
             return Err(ArticulationError::InvalidTree);
         }
-        let collision_exclusions = joints
+        let joint_collision_exclusions = joints
             .iter()
             .map(|joint| ordered_pair(joint.parent, joint.child))
             .collect();
@@ -725,7 +727,9 @@ impl Articulation {
             joint_armatures: vec![[0.0; 3]; joint_count],
             coordinate_limits: Vec::new(),
             dof,
-            collision_exclusions,
+            collision_exclusions: BTreeSet::new(),
+            joint_collision_exclusions,
+            joint_contacts_enabled: false,
         };
         articulation.set_mimics(&[])?;
         Ok(articulation)
@@ -821,6 +825,7 @@ impl Articulation {
         articulation
             .collision_exclusions
             .extend(self.collision_exclusions.iter().copied());
+        articulation.joint_contacts_enabled = self.joint_contacts_enabled;
         let layout = |link, edge| -> Result<FreeBodyCoordinates, ArticulationError> {
             let angular = articulation
                 .joint_coordinate_range(edge)
@@ -853,6 +858,11 @@ impl Articulation {
     /// Number of links in stable input order.
     pub fn link_count(&self) -> usize {
         self.links.len()
+    }
+
+    /// Physical joint endpoints and frames in stable articulation edge order.
+    pub fn joint_specs(&self) -> &[JointSpec] {
+        &self.joints
     }
 
     #[cfg(feature = "gpu-contact")]
@@ -1170,7 +1180,27 @@ impl Articulation {
 
     /// Whether a pair should skip articulated self-collision.
     pub fn adjacent(&self, a: usize, b: usize) -> bool {
+        self.collision_pair_excluded(a, b)
+            || (!self.joint_contacts_enabled
+                && self
+                    .joint_collision_exclusions
+                    .contains(&ordered_pair(a, b)))
+    }
+
+    /// Whether a pair is explicitly excluded independently of joint adjacency.
+    pub fn collision_pair_excluded(&self, a: usize, b: usize) -> bool {
         self.collision_exclusions.contains(&ordered_pair(a, b))
+    }
+
+    /// Whether direct joint neighbors may collide unless explicitly excluded.
+    pub fn joint_contacts_enabled(&self) -> bool {
+        self.joint_contacts_enabled
+    }
+
+    /// Enable direct joint-neighbor contacts without clearing explicit exclusions.
+    /// Resident owners must be rebuilt when their preallocated pair topology changes.
+    pub fn set_joint_contacts_enabled(&mut self, enabled: bool) {
+        self.joint_contacts_enabled = enabled;
     }
 
     /// Hard position limit of a scalar revolute or prismatic slot, when present.

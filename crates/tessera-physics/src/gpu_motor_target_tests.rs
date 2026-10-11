@@ -47,6 +47,7 @@ fn resident_gpu_motor_targets_scatter_delay_boundaries_reset_and_validation() {
     input.joints = vec![
         GpuJointForceInput {
             motor: Some(JointMotor {
+                model: crate::articulated_world::MotorModel::ForceBased,
                 position_target: Some(0.0),
                 velocity_target: 0.0,
                 stiffness: 1.0,
@@ -57,6 +58,7 @@ fn resident_gpu_motor_targets_scatter_delay_boundaries_reset_and_validation() {
         },
         GpuJointForceInput {
             motor: Some(JointMotor {
+                model: crate::articulated_world::MotorModel::ForceBased,
                 position_target: None,
                 velocity_target: 0.0,
                 stiffness: 0.0,

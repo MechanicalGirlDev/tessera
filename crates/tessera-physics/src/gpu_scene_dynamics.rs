@@ -12,6 +12,14 @@ use crate::gpu_articulated_ground_contact::GpuArticulatedExternalSphereBodies;
 use crate::gpu_contact_pipeline::GpuContactDevice;
 use crate::gpu_kinematic_body::{GpuKinematicBody, GpuKinematicBodyBatch, GpuKinematicBodyError};
 
+#[cfg(test)]
+#[path = "gpu_scene_reset_tests.rs"]
+mod reset_tests;
+
+#[path = "gpu_scene_reset.rs"]
+mod scene_reset;
+pub use scene_reset::GpuSceneResetTemplates;
+
 /// Failure to construct, advance, or synchronize resident scene dynamics.
 #[derive(Debug, thiserror::Error)]
 pub enum GpuSceneDynamicsError {
@@ -39,6 +47,9 @@ pub enum GpuSceneDynamicsError {
     /// Environment or effort counts do not match the resident layout.
     #[error("resident environment or effort count does not match")]
     EnvironmentCount,
+    /// The packed contact solver requires one shared contact and loop policy.
+    #[error("resident environments must share the same contact and loop constraint policy")]
+    ConstraintPolicyMismatch,
     /// The single-environment batch did not return its environment.
     #[error("resident environment output is missing")]
     MissingOutput,
@@ -184,6 +195,45 @@ fn matches_source(
         && current.state.positions == expected.positions
         && current.state.velocities == expected.velocities
         && current.state.orientations == expected.orientations
+}
+
+fn configure_scene_policies(
+    batch: &mut GpuArticulatedDynamicsBatch,
+    worlds: &[&ArticulatedWorld],
+    sources: &[&WorldSceneDynamics],
+) -> Result<(), GpuSceneDynamicsError> {
+    let policy = worlds
+        .first()
+        .ok_or(GpuSceneDynamicsError::EnvironmentCount)?
+        .constraint_policy();
+    if worlds
+        .iter()
+        .any(|world| world.constraint_policy() != policy)
+    {
+        return Err(GpuSceneDynamicsError::ConstraintPolicyMismatch);
+    }
+    let mut prescribed = Vec::with_capacity(worlds.len());
+    let mut compliance = Vec::with_capacity(worlds.len());
+    for (world, source) in worlds.iter().zip(sources) {
+        let scene = &source.scene;
+        let prefix = if world.floating { 6 } else { 0 };
+        let mut mask = vec![false; scene.articulation.dof()];
+        mask[scene.robot_coordinates.clone()]
+            .copy_from_slice(&world.prescribed_coordinates()[prefix..]);
+        if let Some(root) = &scene.robot_root {
+            mask[root.translation.clone()].copy_from_slice(&world.prescribed_coordinates()[..3]);
+            mask[root.angular.clone()].copy_from_slice(&world.prescribed_coordinates()[3..6]);
+        }
+        let mut limits =
+            vec![crate::prescribed_dof::ConstraintCompliance::default(); scene.articulation.dof()];
+        limits[scene.robot_coordinates.clone()].copy_from_slice(world.joint_limit_compliance());
+        prescribed.push(mask);
+        compliance.push(limits);
+    }
+    batch.set_prescribed_coordinates(&prescribed)?;
+    batch.set_joint_limit_compliance(&compliance)?;
+    batch.set_constraint_policy(policy)?;
+    Ok(())
 }
 
 fn upload_static_scene_poses(
@@ -401,6 +451,36 @@ pub struct GpuSceneDynamicsBatch {
 }
 
 impl GpuSceneDynamicsBatch {
+    /// Enable imported actuators using each composed scene's robot coordinate prefix.
+    pub fn enable_mjcf_actuators(
+        &mut self,
+        actuators: &[crate::mjcf::MjcfActuators],
+    ) -> Result<(), GpuSceneDynamicsError> {
+        if self.faulted {
+            return Err(GpuSceneDynamicsError::Faulted);
+        }
+        let prefixes = self
+            .sources
+            .iter()
+            .map(|source| source.scene.robot_coordinates.start)
+            .collect::<Vec<_>>();
+        self.batch.enable_mjcf_actuators(actuators, &prefixes)?;
+        Ok(())
+    }
+
+    /// Replace held imported controls in one environment without evaluating feedback.
+    pub fn update_mjcf_controls(
+        &self,
+        environment: usize,
+        controls: &[f64],
+    ) -> Result<(), GpuSceneDynamicsError> {
+        if self.faulted {
+            return Err(GpuSceneDynamicsError::Faulted);
+        }
+        self.batch.update_mjcf_controls(environment, controls)?;
+        Ok(())
+    }
+
     /// Construct one device batch for all worlds in slice order.
     pub fn new(
         worlds: &[ArticulatedWorld],
@@ -429,7 +509,7 @@ impl GpuSceneDynamicsBatch {
             .iter()
             .map(|source| source.scene.gpu_spherical_state(&source.state))
             .collect::<Result<Vec<_>, _>>()?;
-        let batch = if spherical.iter().all(Vec::is_empty) {
+        let mut batch = if spherical.iter().all(Vec::is_empty) {
             GpuArticulatedDynamicsBatch::new(context, &inputs, timestep)?
         } else {
             let drives: Vec<_> = spherical
@@ -445,6 +525,11 @@ impl GpuSceneDynamicsBatch {
                 &drives,
             )?
         };
+        configure_scene_policies(
+            &mut batch,
+            &worlds.iter().collect::<Vec<_>>(),
+            &sources.iter().collect::<Vec<_>>(),
+        )?;
         let unpaired = UnpairedBodies::new(
             &worlds.iter().collect::<Vec<_>>(),
             &bodies,
@@ -726,6 +811,30 @@ pub struct GpuSceneDynamics {
 }
 
 impl GpuSceneDynamics {
+    /// Enable imported actuators in the composed scene's robot coordinate range.
+    pub fn enable_mjcf_actuators(
+        &mut self,
+        actuators: &crate::mjcf::MjcfActuators,
+    ) -> Result<(), GpuSceneDynamicsError> {
+        if self.faulted {
+            return Err(GpuSceneDynamicsError::Faulted);
+        }
+        self.batch.enable_mjcf_actuators(
+            core::slice::from_ref(actuators),
+            &[self.source.scene.robot_coordinates.start],
+        )?;
+        Ok(())
+    }
+
+    /// Replace held imported controls without evaluating actuator feedback on the host.
+    pub fn update_mjcf_controls(&self, controls: &[f64]) -> Result<(), GpuSceneDynamicsError> {
+        if self.faulted {
+            return Err(GpuSceneDynamicsError::Faulted);
+        }
+        self.batch.update_mjcf_controls(0, controls)?;
+        Ok(())
+    }
+
     /// Build a fixed inertial-root batch containing the robot and scene bodies.
     /// Floating scene bodies and spherical robot joints use quaternion state.
     pub fn new(
@@ -738,7 +847,7 @@ impl GpuSceneDynamics {
             world.gpu_scene_dynamics_input(&source, &vec![0.0; world.articulation.dof()])?;
         let bodies = input.external_sphere_bodies.clone();
         let spherical = source.scene.gpu_spherical_state(&source.state)?;
-        let batch = if spherical.is_empty() {
+        let mut batch = if spherical.is_empty() {
             GpuArticulatedDynamicsBatch::new(context, &[input], timestep)?
         } else {
             let drives = vec![None; spherical.len()];
@@ -751,6 +860,7 @@ impl GpuSceneDynamics {
                 &[drives],
             )?
         };
+        configure_scene_policies(&mut batch, &[world], &[&source])?;
         let unpaired =
             UnpairedBodies::new(&[world], core::slice::from_ref(&bodies), context, timestep)?;
         Ok(Self {

@@ -9,16 +9,28 @@ struct JointForce {
 @group(0) @binding(0) var<storage, read> parameters: array<JointForce>;
 @group(0) @binding(1) var<storage, read> positions: array<f32>;
 @group(0) @binding(2) var<storage, read> velocities: array<f32>;
-@group(0) @binding(3) var<storage, read> owners: array<u32>;
+@group(0) @binding(3) var<storage, read> owners: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> status: array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> base_forces: array<f32>;
 @group(0) @binding(6) var<storage, read_write> vectors: array<f32>;
+@group(0) @binding(7) var<storage, read> inverse_mass: array<f32>;
+
+@compute @workgroup_size(64)
+fn prepare_native_mass(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    let coordinate = invocation.x;
+    if (coordinate >= arrayLength(&parameters)) { return; }
+    let input = parameters[coordinate];
+    if (input.implicit.w != 0.0) {
+        vectors[bitcast<u32>(input.implicit.y)] = input.implicit.x;
+    }
+}
 
 @compute @workgroup_size(64)
 fn assemble_joint_forces(@builtin(global_invocation_id) invocation: vec3<u32>) {
     let coordinate = invocation.x;
     if (coordinate >= arrayLength(&parameters)) { return; }
-    if (atomicLoad(&status[owners[coordinate]]) != 0u) { return; }
+    let owner = owners[coordinate];
+    if (atomicLoad(&status[owner.x]) != 0u) { return; }
     let input = parameters[coordinate];
     let position = positions[coordinate];
     let velocity = velocities[coordinate];
@@ -35,7 +47,17 @@ fn assemble_joint_forces(@builtin(global_invocation_id) invocation: vec3<u32>) {
             input.motor_gains.z != 0.0);
         motor = input.motor_gains.x * position_error
             + input.motor_gains.y * (input.motor_targets.y - velocity);
-        motor = clamp(motor, -input.motor_targets.z, input.motor_targets.z);
+        if (input.motor_gains.w != 0.0) {
+            let response = inverse_mass[owner.y];
+            if (!(response >= 0.0) || !(response < 3.402823e38)) {
+                atomicOr(&status[owner.x], 1u);
+                return;
+            }
+            if (response == 0.0) { motor = 0.0; } else { motor /= response; }
+        }
+        if (input.motor_targets.z >= 0.0) {
+            motor = clamp(motor, -input.motor_targets.z, input.motor_targets.z);
+        }
     }
     var force = input.passive.w + spring + damping + motor;
     if (input.implicit.w != 0.0) {

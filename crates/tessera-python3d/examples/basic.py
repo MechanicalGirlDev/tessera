@@ -9,6 +9,7 @@ from tessera3d import (
     GpuSphereBatch,
     GpuSphereWorld,
     JointMotor,
+    MotorModel,
     LinkColliderKind,
     Material,
     MeshAsset,
@@ -54,6 +55,7 @@ def main() -> None:
     robot.set_joint_motor(
         0,
         JointMotor(
+            model=MotorModel.FORCE_BASED,
             position_target=0.4,
             velocity_target=0.0,
             stiffness=10.0,
@@ -73,7 +75,9 @@ def main() -> None:
     assert len(robot.generalized_acceleration_gpu([0.0])) == 1
     assert len(robot.link_poses()) == 2
 
-    batch_model = BatchModel(format=ModelFormat.URDF, xml=urdf, floating_base=False, meshes=[])
+    batch_model = BatchModel(
+        format=ModelFormat.URDF, xml=urdf, floating_base=False, meshes=[], urdf_options=None
+    )
     articulated_batch = ArticulatedBatch([batch_model, batch_model])
     assert articulated_batch.len() == 2
     assert articulated_batch.environment_info(0).joint_ranges[0].name == "slide"
@@ -88,6 +92,7 @@ def main() -> None:
         0,
         0,
         JointMotor(
+            model=MotorModel.FORCE_BASED,
             position_target=0.3,
             velocity_target=0.0,
             stiffness=10.0,
@@ -113,6 +118,7 @@ def main() -> None:
     diagonal = 3.0 ** -0.5
     mesh = MeshAsset(
         uri="mesh.obj",
+        indexed_parts=[],
         parts=[
             ConvexMeshPart(
                 vertices=[vec(0, 0, 0), vec(1, 0, 0), vec(0, 1, 0), vec(0, 0, 1)],

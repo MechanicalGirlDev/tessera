@@ -65,6 +65,12 @@ pub struct GpuArticulatedResetTemplates {
     status_offset: usize,
 }
 
+impl GpuArticulatedResetTemplates {
+    pub(crate) fn matches_source(&self, state: &GpuGeneralizedStateBatch) -> bool {
+        self.positions == *state.position_buffer()
+    }
+}
+
 impl GpuGeneralizedStateBatch {
     /// Capture every current environment on the device, without readback.
     ///

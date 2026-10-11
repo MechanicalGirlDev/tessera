@@ -134,6 +134,29 @@ fn revolute_angle(joint: BallJoint, a: RigidState, b: RigidState) -> f32 {
     return atan2(dot(axis_a, cross(tangent_a, tangent_b)), dot(tangent_a, tangent_b));
 }
 
+// The logarithm is a coordinate, not an angular-velocity vector. Its row
+// gradient is the transpose of the inverse SO(3) left Jacobian.
+fn spherical_axis(joint: BallJoint, a: RigidState, b: RigidState) -> vec4<f32> {
+    var q = normalize(quat_mul(quat_conjugate(a.orientation), b.orientation));
+    if (q.w < 0.0 || (q.w == 0.0 &&
+        (q.x < 0.0 || (q.x == 0.0 && (q.y < 0.0 || (q.y == 0.0 && q.z < 0.0)))))) {
+        q = -q;
+    }
+    let sine = length(q.xyz);
+    var rotation = 2.0 * q.xyz;
+    if (sine > 1e-6) { rotation = q.xyz * (2.0 * atan2(sine, q.w) / sine); }
+    let theta2 = dot(rotation, rotation);
+    var coefficient = 1.0 / 12.0 + theta2 / 720.0;
+    if (theta2 > 1e-4) {
+        coefficient = (1.0 - 0.5 * length(rotation) * q.w / sine) / theta2;
+    }
+    let component = joint.bodies.z - 4u;
+    let unit = axis(component);
+    let gradient = unit + 0.5 * cross(rotation, unit)
+        + coefficient * cross(rotation, cross(rotation, unit));
+    return vec4<f32>(rotate(a.orientation, gradient), rotation[component]);
+}
+
 fn quat_from_rotation(rotation: vec3<f32>) -> vec4<f32> {
     let angle = length(rotation);
     if (angle < 1e-5) {
@@ -178,6 +201,8 @@ fn capture_temporal_drives(@builtin(global_invocation_id) id: vec3<u32>) {
         let axis=normalize(rotate(quat_mul(a.orientation,joint.frame_a),vec3<f32>(0.0,0.0,1.0)));
         coordinate=dot((b.position_inverse_mass.xyz-a.position_inverse_mass.xyz)
             +anchor_arm(b,joint.anchor_b.xyz)-anchor_arm(a,joint.anchor_a.xyz),axis);
+    } else if (joint.bodies.z>=4u) {
+        coordinate=spherical_axis(joint,states[joint.bodies.x],states[joint.bodies.y]).w;
     }
     angles[index].drive_target=joint.servo.y*(joint.servo.x-coordinate)+joint.servo.z*joint.drive.x;
 }
@@ -228,7 +253,7 @@ fn warm_joint(index: u32) {
         a = apply_impulse(a, anchor_arm(a, joint.anchor_a.xyz), -impulse);
         b = apply_impulse(b, anchor_arm(b, joint.anchor_b.xyz), impulse);
     }
-    if (joint.bodies.z != 0u) {
+    if (joint.bodies.z != 0u && joint.bodies.z < 4u) {
         var angular = angular_impulses[index].xyz;
         if (joint.bodies.z == 2u) {
             let hinge_axis = rotate(a.orientation, joint.frame_a.xyz);
@@ -241,8 +266,9 @@ fn warm_joint(index: u32) {
     }
     if ((joint.bodies.w & 5u) != 0u) {
         let motor_impulse = angular_impulses[index].w;
-        if (joint.bodies.z == 2u) {
-            let hinge_axis = normalize(rotate(a.orientation, joint.frame_a.xyz));
+        if (joint.bodies.z == 2u || joint.bodies.z >= 4u) {
+            var hinge_axis = normalize(rotate(a.orientation, joint.frame_a.xyz));
+            if (joint.bodies.z >= 4u) { hinge_axis = spherical_axis(joint,a,b).xyz; }
             a = apply_angular_impulse(a, -hinge_axis * motor_impulse);
             b = apply_angular_impulse(b, hinge_axis * motor_impulse);
         } else if (joint.bodies.z == 3u) {
@@ -253,8 +279,9 @@ fn warm_joint(index: u32) {
     }
     if ((joint.bodies.w & 2u) != 0u) {
         let limit_impulse = impulses[index].w;
-        if (joint.bodies.z == 2u) {
-            let hinge_axis = normalize(rotate(a.orientation, joint.frame_a.xyz));
+        if (joint.bodies.z == 2u || joint.bodies.z >= 4u) {
+            var hinge_axis = normalize(rotate(a.orientation, joint.frame_a.xyz));
+            if (joint.bodies.z >= 4u) { hinge_axis = spherical_axis(joint,a,b).xyz; }
             a = apply_angular_impulse(a, -hinge_axis * limit_impulse);
             b = apply_angular_impulse(b, hinge_axis * limit_impulse);
         } else if (joint.bodies.z == 3u) {
@@ -301,6 +328,7 @@ fn solve_joint(index: u32) {
     var slide_tangent = vec3<f32>(1.0, 0.0, 0.0);
     var slide_bitangent = vec3<f32>(0.0, 1.0, 0.0);
     var linear_components = 3u;
+    if (joint.bodies.z >= 4u) { linear_components = 0u; }
     if (joint.bodies.z == 3u) {
         slide_axis = normalize(rotate(quat_mul(a.orientation, joint.frame_a), vec3<f32>(0.0, 0.0, 1.0)));
         let pivot = select(vec3<f32>(1.0, 0.0, 0.0),
@@ -314,11 +342,13 @@ fn solve_joint(index: u32) {
         var drive_axis = slide_axis;
         if (joint.bodies.z == 2u) {
             drive_axis = normalize(rotate(a.orientation, joint.frame_a.xyz));
+        } else if (joint.bodies.z >= 4u) {
+            drive_axis = spherical_axis(joint,a,b).xyz;
         }
         var motor_accumulated = angular_impulses[index].w;
         var mass = 0.0;
         var relative = 0.0;
-        if (joint.bodies.z == 2u) {
+        if (joint.bodies.z == 2u || joint.bodies.z >= 4u) {
             mass = dot(drive_axis, inverse_inertia_mul(a, drive_axis)) +
                    dot(drive_axis, inverse_inertia_mul(b, drive_axis));
             relative = dot(b.angular_velocity.xyz - a.angular_velocity.xyz, drive_axis);
@@ -327,23 +357,30 @@ fn solve_joint(index: u32) {
             relative = dot(contact_velocity(b, arm_b) - contact_velocity(a, arm_a), drive_axis);
         }
         if (mass > 1e-12) {
-            let maximum = joint.drive.y * params.dt;
+            // A spherical log-coordinate row need not be unit length. Bound
+            // physical torque, rather than the generalized row impulse.
+            var maximum = 3.402823e38;
+            if (joint.drive.y >= 0.0) {
+                maximum = min(joint.drive.y, maximum / params.dt) * params.dt / length(drive_axis);
+            }
             var next = clamp(motor_accumulated + (joint.drive.x - relative) / mass, -maximum, maximum);
             if ((joint.bodies.w & 4u) != 0u) {
                 var coordinate = dot(error, slide_axis);
                 if (joint.bodies.z == 2u) { coordinate = angles[index].angle; }
+                if (joint.bodies.z >= 4u) { coordinate = spherical_axis(joint,a,b).w; }
+                let force_scale = select(1.0, 1.0 / mass, joint.servo.w > 0.5);
                 if (params.temporal.w!=0.0) {
-                    let residual=params.dt*(angles[index].drive_target-joint.servo.z*relative)-motor_accumulated;
-                    let increment=residual/(1.0+params.dt*joint.servo.z*mass);
+                    let residual=params.dt*force_scale*(angles[index].drive_target-joint.servo.z*relative)-motor_accumulated;
+                    let increment=residual/(1.0+params.dt*force_scale*joint.servo.z*mass);
                     next=clamp(motor_accumulated+increment,-maximum,maximum);
                 } else {
                     let commanded_force = joint.servo.y * (joint.servo.x - coordinate) +
                                           joint.servo.z * (joint.drive.x - relative);
-                    next = clamp(commanded_force * params.dt, -maximum, maximum);
+                    next = clamp(commanded_force * force_scale * params.dt, -maximum, maximum);
                 }
             }
             let delta = next - motor_accumulated;
-            if (joint.bodies.z == 2u) {
+            if (joint.bodies.z == 2u || joint.bodies.z >= 4u) {
                 a = apply_angular_impulse(a, -drive_axis * delta);
                 b = apply_angular_impulse(b, drive_axis * delta);
             } else {
@@ -366,21 +403,28 @@ fn solve_joint(index: u32) {
             mass = dot(limit_axis, inverse_inertia_mul(a, limit_axis)) +
                    dot(limit_axis, inverse_inertia_mul(b, limit_axis));
             relative = dot(b.angular_velocity.xyz - a.angular_velocity.xyz, limit_axis);
+        } else if (joint.bodies.z >= 4u) {
+            let row = spherical_axis(joint,a,b);
+            limit_axis = row.xyz;
+            displacement = row.w;
+            mass = dot(limit_axis, inverse_inertia_mul(a, limit_axis)) +
+                   dot(limit_axis, inverse_inertia_mul(b, limit_axis));
+            relative = dot(b.angular_velocity.xyz - a.angular_velocity.xyz, limit_axis);
         }
         if (mass > 1e-12) {
             let predicted = displacement + relative * params.dt;
             var next = 0.0;
             if (displacement < joint.drive.z || predicted < joint.drive.z) {
                 let previous=max(0.0,limit_accumulated);
-                let desired=limit_target(joint.drive.z-displacement,joint.bodies.z==2u);
+                let desired=limit_target(joint.drive.z-displacement,joint.bodies.z!=3u);
                 next=max(0.0,previous+limit_delta(relative,desired,mass,previous,displacement>=joint.drive.z));
             } else if (displacement > joint.drive.w || predicted > joint.drive.w) {
                 let previous=min(0.0,limit_accumulated);
-                let desired=-limit_target(displacement-joint.drive.w,joint.bodies.z==2u);
+                let desired=-limit_target(displacement-joint.drive.w,joint.bodies.z!=3u);
                 next=min(0.0,previous+limit_delta(relative,desired,mass,previous,displacement<=joint.drive.w));
             }
             let delta = next - limit_accumulated;
-            if (joint.bodies.z == 2u) {
+            if (joint.bodies.z == 2u || joint.bodies.z >= 4u) {
                 a = apply_angular_impulse(a, -limit_axis * delta);
                 b = apply_angular_impulse(b, limit_axis * delta);
             } else {

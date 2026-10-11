@@ -56,6 +56,16 @@ use tessera_physics::mjcf::{
 use tessera_physics::sphere_world::{
     SphereBody, SphereWorld as CoreSphereWorld, SphereWorldParams,
 };
+
+mod simulation_state;
+pub use simulation_state::{SimulationSnapshot, SimulationState};
+mod loader_metadata;
+pub use loader_metadata::{JointInfo, JointMimic, JointType, UrdfOptions};
+mod constraint_policy;
+pub use constraint_policy::{ConstraintCompliance, ConstraintPolicy};
+mod actuator_feedback;
+mod gpu_simulation_reset;
+pub use gpu_simulation_reset::GpuSimulationSnapshot;
 use tessera_physics::urdf::{
     LoadedUrdf, UrdfLoadOptions, load_urdf_str, load_urdf_str_with_mesh_resolver,
 };
@@ -63,7 +73,7 @@ use tessera_physics::urdf::{
 mod mpm;
 pub use mpm::*;
 mod primitive_batch;
-pub use primitive_batch::GpuPrimitiveBatch;
+pub use primitive_batch::{GpuPrimitiveBatch, GpuSolveParameters, GpuSphericalLimit};
 
 uniffi::setup_scaffolding!();
 
@@ -912,6 +922,10 @@ impl From<GpuRigidAxisMotor> for GpuAxisMotor {
 /// Force-limited position and velocity servo on a GPU-resident joint axis.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct GpuAxisServo {
+    /// Physical-force gains or effective-mass-normalized acceleration gains.
+    /// Omission selects ForceBased.
+    #[uniffi(default = None)]
+    pub model: Option<MotorModel>,
     /// Target relative angle or displacement.
     pub position_target: f64,
     /// Target relative angular or linear velocity.
@@ -927,6 +941,7 @@ pub struct GpuAxisServo {
 impl From<GpuAxisServo> for GpuRigidAxisServo {
     fn from(value: GpuAxisServo) -> Self {
         Self {
+            model: value.model.unwrap_or_default().into(),
             position_target: value.position_target as f32,
             velocity_target: value.velocity_target as f32,
             stiffness: value.stiffness as f32,
@@ -939,6 +954,7 @@ impl From<GpuAxisServo> for GpuRigidAxisServo {
 impl From<GpuRigidAxisServo> for GpuAxisServo {
     fn from(value: GpuRigidAxisServo) -> Self {
         Self {
+            model: Some(value.model.into()),
             position_target: f64::from(value.position_target),
             velocity_target: f64::from(value.velocity_target),
             stiffness: f64::from(value.stiffness),
@@ -1442,9 +1458,43 @@ impl From<ColliderMaterial> for Material {
     }
 }
 
+/// Whether motor gains represent force or acceleration.
+#[derive(Clone, Copy, Debug, Default, uniffi::Enum)]
+pub enum MotorModel {
+    /// Gains produce physical force or torque.
+    #[default]
+    ForceBased,
+    /// Gains produce acceleration, normalized through effective inverse mass.
+    AccelerationBased,
+}
+
+impl From<MotorModel> for tessera_physics::articulated_world::MotorModel {
+    fn from(model: MotorModel) -> Self {
+        match model {
+            MotorModel::ForceBased => Self::ForceBased,
+            MotorModel::AccelerationBased => Self::AccelerationBased,
+        }
+    }
+}
+
+impl From<tessera_physics::articulated_world::MotorModel> for MotorModel {
+    fn from(model: tessera_physics::articulated_world::MotorModel) -> Self {
+        match model {
+            tessera_physics::articulated_world::MotorModel::ForceBased => Self::ForceBased,
+            tessera_physics::articulated_world::MotorModel::AccelerationBased => {
+                Self::AccelerationBased
+            }
+        }
+    }
+}
+
 /// Optional position target and a bounded generalized-force motor.
 #[derive(Clone, Copy, Debug, uniffi::Record)]
 pub struct JointMotor {
+    /// Physical-force or effective-mass-normalized acceleration gains.
+    /// Omission selects ForceBased.
+    #[uniffi(default = None)]
+    pub model: Option<MotorModel>,
     /// Position target, or none for velocity-only drive.
     pub position_target: Option<f64>,
     /// Velocity target.
@@ -1460,6 +1510,7 @@ pub struct JointMotor {
 impl From<JointMotor> for CoreJointMotor {
     fn from(value: JointMotor) -> Self {
         Self {
+            model: value.model.unwrap_or_default().into(),
             position_target: value.position_target,
             velocity_target: value.velocity_target,
             stiffness: value.stiffness,
@@ -1472,6 +1523,7 @@ impl From<JointMotor> for CoreJointMotor {
 impl From<CoreJointMotor> for JointMotor {
     fn from(value: CoreJointMotor) -> Self {
         Self {
+            model: Some(value.model.into()),
             position_target: value.position_target,
             velocity_target: value.velocity_target,
             stiffness: value.stiffness,
@@ -2227,13 +2279,25 @@ pub struct ConvexMeshPart {
     pub edge_directions: Vec<Vec3>,
 }
 
-/// One external mesh URI and its convex decomposition.
+/// Indexed collision surface supplied without filling concavities or holes.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IndexedMeshPart {
+    /// Unscaled vertices in model coordinates.
+    pub vertices: Vec<Vec3>,
+    /// Vertex indices of surface triangles.
+    pub triangles: Vec<GpuTriangle>,
+}
+
+/// One external URI with convex parts and/or indexed collision surfaces.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MeshAsset {
     /// URI as used by the URDF or MJCF document.
     pub uri: String,
-    /// Nonempty convex decomposition.
+    /// Convex decomposition; may be empty for indexed-only assets.
     pub parts: Vec<ConvexMeshPart>,
+    /// Indexed surfaces used by URDF convex_hull=false.
+    #[uniffi(default)]
+    pub indexed_parts: Vec<IndexedMeshPart>,
 }
 
 /// Source format for one articulated batch environment.
@@ -2256,6 +2320,9 @@ pub struct BatchModel {
     pub floating_base: bool,
     /// External convex collision meshes referenced by this model.
     pub meshes: Vec<MeshAsset>,
+    /// Explicit URDF loader policies, or native defaults using floating_base.
+    #[uniffi(default = None)]
+    pub urdf_options: Option<UrdfOptions>,
 }
 
 /// Stable metadata for one articulated batch environment.
@@ -2267,16 +2334,19 @@ pub struct BatchEnvironmentInfo {
     pub link_names: Vec<String>,
     /// Generalized-coordinate ranges in joint order.
     pub joint_ranges: Vec<JointRange>,
+    /// Original identities, physical endpoints, limits, and mimic mappings.
+    pub joint_metadata: Vec<JointInfo>,
 }
 
-fn mesh_assets(
-    assets: Vec<MeshAsset>,
-) -> Result<BTreeMap<String, Vec<ConvexMeshPart>>, TesseraError> {
+fn mesh_assets(assets: Vec<MeshAsset>) -> Result<BTreeMap<String, MeshAsset>, TesseraError> {
     let mut by_uri = BTreeMap::new();
     for asset in assets {
-        if asset.uri.is_empty() || asset.parts.is_empty() || by_uri.contains_key(&asset.uri) {
+        if asset.uri.is_empty()
+            || (asset.parts.is_empty() && asset.indexed_parts.is_empty())
+            || by_uri.contains_key(&asset.uri)
+        {
             return Err(failed(
-                "mesh URIs must be unique, nonempty, and have convex parts",
+                "mesh URIs must be unique, nonempty, and have collision geometry",
             ));
         }
         for part in &asset.parts {
@@ -2295,13 +2365,23 @@ fn mesh_assets(
             )
             .map_err(failed)?;
         }
-        let _ = by_uri.insert(asset.uri, asset.parts);
+        for part in &asset.indexed_parts {
+            let _geometry = TriangleMeshGeometry::new(
+                part.vertices.iter().copied().map(Vec3::nalgebra).collect(),
+                part.triangles
+                    .iter()
+                    .map(|triangle| [triangle.a, triangle.b, triangle.c])
+                    .collect(),
+            )
+            .map_err(failed)?;
+        }
+        let _previous = by_uri.insert(asset.uri.clone(), asset);
     }
     Ok(by_uri)
 }
 
 fn resolve_mesh_parts(
-    assets: &BTreeMap<String, Vec<ConvexMeshPart>>,
+    assets: &BTreeMap<String, MeshAsset>,
     filename: &str,
     scale: [f64; 3],
 ) -> Result<Vec<ConvexGeometry>, String> {
@@ -2314,7 +2394,11 @@ fn resolve_mesh_parts(
     let parts = assets
         .get(filename)
         .ok_or_else(|| format!("mesh URI not provided: {filename}"))?;
+    if parts.parts.is_empty() {
+        return Err(format!("convex mesh parts not provided: {filename}"));
+    }
     parts
+        .parts
         .iter()
         .map(|part| {
             let vertices = part
@@ -2348,6 +2432,53 @@ fn resolve_mesh_parts(
             ConvexGeometry::new(vertices, normals, edges).map_err(|error| error.to_string())
         })
         .collect()
+}
+
+struct MeshAssetResolver {
+    assets: BTreeMap<String, MeshAsset>,
+}
+
+impl tessera_physics::mesh::ConvexMeshResolver for MeshAssetResolver {
+    fn resolve(&mut self, filename: &str, scale: [f64; 3]) -> Result<Vec<ConvexGeometry>, String> {
+        resolve_mesh_parts(&self.assets, filename, scale)
+    }
+
+    fn resolve_indexed(
+        &mut self,
+        filename: &str,
+        scale: [f64; 3],
+    ) -> Result<Vec<TriangleMeshGeometry>, String> {
+        if scale
+            .iter()
+            .any(|value| !value.is_finite() || *value == 0.0)
+        {
+            return Err("mesh scale must be finite and nonzero".into());
+        }
+        let asset = self
+            .assets
+            .get(filename)
+            .ok_or_else(|| format!("mesh URI not provided: {filename}"))?;
+        if asset.indexed_parts.is_empty() {
+            return Err(format!("indexed mesh surfaces not provided: {filename}"));
+        }
+        asset
+            .indexed_parts
+            .iter()
+            .map(|part| {
+                TriangleMeshGeometry::new(
+                    part.vertices
+                        .iter()
+                        .map(|vertex| vertex.nalgebra().component_mul(&Vector3::from(scale)))
+                        .collect(),
+                    part.triangles
+                        .iter()
+                        .map(|triangle| [triangle.a, triangle.b, triangle.c])
+                        .collect(),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
 }
 
 fn gpu_sphere(input: SphereInput) -> Result<(GpuRigidBodyState, f32), TesseraError> {
@@ -2690,6 +2821,8 @@ impl SphereWorld {
 /// Imported stateless MJCF actuator dynamics.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MjcfActuatorDynamics {
+    /// Preserved metadata with no native drive implementation.
+    Unsupported,
     /// Geared constant-force motor.
     Motor,
     /// Scalar position servo.
@@ -2728,9 +2861,15 @@ pub struct MjcfActuatorInfo {
     /// Referenced scalar joint.
     pub joint: String,
     /// Native generalized-coordinate index.
-    pub coordinate: u32,
+    pub coordinate: Option<u32>,
     /// Supported dynamics.
     pub dynamics: MjcfActuatorDynamics,
+    /// Original XML actuator element kind.
+    pub source_kind: String,
+    /// Default-resolved transmission, activation, and other XML attributes.
+    pub attributes: std::collections::HashMap<String, String>,
+    /// Why this definition remains undriven, or none for supported dynamics.
+    pub unsupported_reason: Option<String>,
     /// Motor gear.
     pub gear: f64,
     /// Enabled control clamp; empty when unlimited.
@@ -2745,6 +2884,7 @@ struct ArticulatedInner {
     actuators: MjcfActuators,
     gpu: Option<GpuContactDevice>,
     resident: Option<(f64, GpuSceneDynamics)>,
+    resident_controls: bool,
 }
 
 /// URDF or MJCF articulated world.
@@ -2754,10 +2894,12 @@ pub struct ArticulatedWorld {
     name: String,
     link_names: Vec<String>,
     joint_ranges: Vec<JointRange>,
+    joint_metadata: Vec<JointInfo>,
 }
 
 impl ArticulatedWorld {
     fn from_loaded_urdf(loaded: LoadedUrdf) -> Result<Arc<Self>, TesseraError> {
+        let joint_metadata = loader_metadata::urdf_joints(&loaded)?;
         let joint_ranges = loaded
             .joints
             .into_iter()
@@ -2775,14 +2917,17 @@ impl ArticulatedWorld {
                 actuators: MjcfActuators::default(),
                 gpu: None,
                 resident: None,
+                resident_controls: false,
             }),
             name: loaded.robot_name,
             link_names: loaded.link_names,
             joint_ranges,
+            joint_metadata,
         }))
     }
 
     fn from_loaded_mjcf(loaded: LoadedMjcf) -> Result<Arc<Self>, TesseraError> {
+        let joint_metadata = loader_metadata::mjcf_joints(&loaded)?;
         let joint_ranges = loaded
             .joints
             .into_iter()
@@ -2800,10 +2945,12 @@ impl ArticulatedWorld {
                 actuators: loaded.actuators,
                 gpu: None,
                 resident: None,
+                resident_controls: false,
             }),
             name: loaded.model_name.unwrap_or_default(),
             link_names: loaded.link_names,
             joint_ranges,
+            joint_metadata,
         }))
     }
 }
@@ -2831,9 +2978,9 @@ impl ArticulatedWorld {
         floating_base: bool,
         assets: Vec<MeshAsset>,
     ) -> Result<Arc<Self>, TesseraError> {
-        let assets = mesh_assets(assets)?;
-        let mut resolver =
-            |filename: &str, scale: [f64; 3]| resolve_mesh_parts(&assets, filename, scale);
+        let mut resolver = MeshAssetResolver {
+            assets: mesh_assets(assets)?,
+        };
         let loaded = load_urdf_str_with_mesh_resolver(
             &xml,
             UrdfLoadOptions {
@@ -2859,9 +3006,9 @@ impl ArticulatedWorld {
         xml: String,
         assets: Vec<MeshAsset>,
     ) -> Result<Arc<Self>, TesseraError> {
-        let assets = mesh_assets(assets)?;
-        let mut resolver =
-            |filename: &str, scale: [f64; 3]| resolve_mesh_parts(&assets, filename, scale);
+        let mut resolver = MeshAssetResolver {
+            assets: mesh_assets(assets)?,
+        };
         let loaded =
             load_mjcf_str_with_mesh_resolver(&xml, MjcfLoadOptions::default(), &mut resolver)
                 .map_err(failed)?;
@@ -2885,37 +3032,7 @@ impl ArticulatedWorld {
 
     /// Imported actuator metadata in XML declaration order.
     pub fn actuator_info(&self) -> Result<Vec<MjcfActuatorInfo>, TesseraError> {
-        locked(&self.inner)?
-            .actuators
-            .entries()
-            .iter()
-            .map(|a| {
-                let dynamics = match a.kind {
-                    CoreMjcfActuatorKind::Motor => MjcfActuatorDynamics::Motor,
-                    CoreMjcfActuatorKind::Position { kp, kv } => {
-                        MjcfActuatorDynamics::Position { kp, kv }
-                    }
-                    CoreMjcfActuatorKind::Velocity { kv } => MjcfActuatorDynamics::Velocity { kv },
-                    CoreMjcfActuatorKind::Damper { gain } => MjcfActuatorDynamics::Damper { gain },
-                    CoreMjcfActuatorKind::General { gain, bias, affine } => {
-                        MjcfActuatorDynamics::General {
-                            gain,
-                            bias: bias.to_vec(),
-                            affine,
-                        }
-                    }
-                };
-                Ok(MjcfActuatorInfo {
-                    name: a.name.clone(),
-                    joint: a.joint.clone(),
-                    coordinate: u32::try_from(a.coordinate).map_err(failed)?,
-                    dynamics,
-                    gear: a.gear,
-                    control_range: a.control_range.map_or_else(Vec::new, |r| r.to_vec()),
-                    force_range: a.force_range.map_or_else(Vec::new, |r| r.to_vec()),
-                })
-            })
-            .collect()
+        actuator_feedback::metadata(&locked(&self.inner)?.actuators)
     }
 
     /// Stable imported actuator names, independent of coordinate order.
@@ -3693,12 +3810,14 @@ impl ArticulatedWorld {
             world,
             gpu,
             resident,
+            resident_controls,
             ..
         } = &mut *inner;
-        if !resident.as_ref().is_some_and(|(dt, _)| *dt == timestep) {
+        if *resident_controls || !resident.as_ref().is_some_and(|(dt, _)| *dt == timestep) {
             let context = gpu.as_ref().ok_or_else(|| failed("GPU unavailable"))?;
             let session = GpuSceneDynamics::new(world, context, timestep).map_err(failed)?;
             *resident = Some((timestep, session));
+            *resident_controls = false;
         }
         let (_, session) = resident
             .as_mut()
@@ -3867,9 +3986,11 @@ impl ArticulatedWorld {
 #[derive(Debug)]
 struct ArticulatedBatchInner {
     batch: CoreArticulatedBatch,
+    actuators: Vec<MjcfActuators>,
     gpu: Option<GpuContactDevice>,
     device_mass_cache: ArticulatedDeviceMassStepCache,
     resident: Option<(f64, GpuSceneDynamicsBatch)>,
+    resident_controls: bool,
 }
 
 /// Independent articulated environments with packed GPU contact solves.
@@ -3900,21 +4021,27 @@ impl ArticulatedBatch {
         let mut batch = CoreArticulatedBatch::new();
         let mut ids = Vec::with_capacity(models.len());
         let mut info = Vec::with_capacity(models.len());
+        let mut actuators = Vec::with_capacity(models.len());
         for model in models {
-            let assets = mesh_assets(model.meshes)?;
-            let mut resolver =
-                |filename: &str, scale: [f64; 3]| resolve_mesh_parts(&assets, filename, scale);
-            let (world, metadata) = match model.format {
+            let mut resolver = MeshAssetResolver {
+                assets: mesh_assets(model.meshes)?,
+            };
+            let (world, metadata, imported_actuators) = match model.format {
                 ModelFormat::Urdf => {
                     let loaded = load_urdf_str_with_mesh_resolver(
                         &model.xml,
-                        UrdfLoadOptions {
-                            floating_base: model.floating_base,
-                            ..Default::default()
-                        },
+                        model
+                            .urdf_options
+                            .map(UrdfOptions::native)
+                            .transpose()?
+                            .unwrap_or(UrdfLoadOptions {
+                                floating_base: model.floating_base,
+                                ..Default::default()
+                            }),
                         &mut resolver,
                     )
                     .map_err(failed)?;
+                    let joint_metadata = loader_metadata::urdf_joints(&loaded)?;
                     let ranges = loaded
                         .joints
                         .iter()
@@ -3932,7 +4059,9 @@ impl ArticulatedBatch {
                             name: loaded.robot_name,
                             link_names: loaded.link_names,
                             joint_ranges: ranges,
+                            joint_metadata,
                         },
+                        MjcfActuators::default(),
                     )
                 }
                 ModelFormat::Mjcf => {
@@ -3942,6 +4071,7 @@ impl ArticulatedBatch {
                         &mut resolver,
                     )
                     .map_err(failed)?;
+                    let joint_metadata = loader_metadata::mjcf_joints(&loaded)?;
                     let ranges = loaded
                         .joints
                         .iter()
@@ -3959,19 +4089,24 @@ impl ArticulatedBatch {
                             name: loaded.model_name.unwrap_or_default(),
                             link_names: loaded.link_names,
                             joint_ranges: ranges,
+                            joint_metadata,
                         },
+                        loaded.actuators,
                     )
                 }
             };
             ids.push(batch.add_environment(world));
             info.push(metadata);
+            actuators.push(imported_actuators);
         }
         Ok(Arc::new(Self {
             inner: Mutex::new(ArticulatedBatchInner {
                 batch,
+                actuators,
                 gpu: None,
                 device_mass_cache: ArticulatedDeviceMassStepCache::new(),
                 resident: None,
+                resident_controls: false,
             }),
             ids,
             info,
@@ -5002,13 +5137,15 @@ impl ArticulatedBatch {
             batch,
             gpu,
             resident,
+            resident_controls,
             ..
         } = &mut *inner;
-        if !resident.as_ref().is_some_and(|(dt, _)| *dt == timestep) {
+        if *resident_controls || !resident.as_ref().is_some_and(|(dt, _)| *dt == timestep) {
             let context = gpu.as_ref().ok_or_else(|| failed("GPU unavailable"))?;
             let session = GpuSceneDynamicsBatch::new(batch.environments(), context, timestep)
                 .map_err(failed)?;
             *resident = Some((timestep, session));
+            *resident_controls = false;
         }
         let (_, session) = resident
             .as_mut()
@@ -7108,10 +7245,10 @@ mod tests {
         let world = ArticulatedWorld::from_mjcf(xml.into()).unwrap();
         assert_eq!(world.actuator_names().unwrap(), ["motor_b", "servo_a"]);
         let info = world.actuator_info().unwrap();
-        assert_eq!(info[0].coordinate, 1);
+        assert_eq!(info[0].coordinate, Some(1));
         assert_eq!(info[0].gear, -2.0);
         assert_eq!(info[0].force_range, [-3.0, 3.0]);
-        assert_eq!(info[1].coordinate, 0);
+        assert_eq!(info[1].coordinate, Some(0));
         assert_eq!(info[1].control_range, [-1.0, 1.0]);
         assert!(matches!(
             info[1].dynamics,
@@ -7292,6 +7429,7 @@ mod tests {
             xml: xml.into(),
             floating_base: false,
             meshes: Vec::new(),
+            urdf_options: None,
         }])
         .unwrap();
         {
@@ -7364,6 +7502,7 @@ mod tests {
         let asset = MeshAsset {
             uri: "mesh.obj".into(),
             parts: vec![tetrahedron()],
+            indexed_parts: vec![],
         };
         let urdf = r#"<robot name="mesh"><link name="base">
           <inertial><mass value="1"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>
@@ -7401,6 +7540,7 @@ mod tests {
             xml: mjcf.into(),
             floating_base: false,
             meshes: vec![asset.clone()],
+            urdf_options: None,
         }])
         .unwrap();
         assert_eq!(batch.environment_info(0).unwrap().link_names, ["root"]);
@@ -7440,6 +7580,7 @@ mod tests {
           <axis xyz="1 0 0"/><limit lower="-1" upper="1" effort="1" velocity="1"/></joint></robot>"#;
         let robot = ArticulatedWorld::from_urdf(xml.into(), false).unwrap();
         let motor = JointMotor {
+            model: Some(MotorModel::ForceBased),
             position_target: Some(0.4),
             velocity_target: 0.0,
             stiffness: 10.0,
@@ -7517,12 +7658,14 @@ mod tests {
                 xml: xml.into(),
                 floating_base: false,
                 meshes: Vec::new(),
+                urdf_options: None,
             },
             BatchModel {
                 format: ModelFormat::Urdf,
                 xml: xml.into(),
                 floating_base: false,
                 meshes: Vec::new(),
+                urdf_options: None,
             },
         ])
         .unwrap();
@@ -7565,6 +7708,7 @@ mod tests {
             xml: xml.into(),
             floating_base: false,
             meshes: Vec::new(),
+            urdf_options: None,
         };
         let batch = ArticulatedBatch::new(vec![model.clone(), model]).unwrap();
         let identity_frame = LinkPose {
@@ -7882,6 +8026,7 @@ mod tests {
             xml: xml.into(),
             floating_base: false,
             meshes: Vec::new(),
+            urdf_options: None,
         }])
         .unwrap();
         let compound = SceneBodyInput {
@@ -7991,6 +8136,7 @@ mod tests {
             xml: xml.into(),
             floating_base: false,
             meshes: Vec::new(),
+            urdf_options: None,
         };
         let batch = ArticulatedBatch::new(vec![model.clone(), model]).unwrap();
         batch.set_joint_couplings(0, vec![coupling]).unwrap();
@@ -8145,6 +8291,7 @@ mod tests {
             xml: urdf.into(),
             floating_base: false,
             meshes: Vec::new(),
+            urdf_options: None,
         };
         let batch = ArticulatedBatch::new(vec![model.clone(), model]).unwrap();
         assert_eq!(batch.len(), 2);

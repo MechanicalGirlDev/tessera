@@ -647,15 +647,27 @@ mod tests {
             radius: 0.4,
             analytic: None,
         };
-        let hulls = [cube([0.0; 3]), sphere(0.8), sphere(2.0)];
+        let mut offset = sphere(0.8);
+        offset.vertices[0] = [0.8, 0.2, -0.15, 0.0];
+        let hulls = [cube([0.0; 3]), sphere(0.8), sphere(2.0), offset];
         let contacts = context
             .convex()
-            .detect(context.device(), context.queue(), &hulls, &[(0, 1), (0, 2)])
+            .detect(
+                context.device(),
+                context.queue(),
+                &hulls,
+                &[(0, 1), (0, 2), (0, 3), (3, 0)],
+            )
             .unwrap();
         assert!(contacts[0].is_contact());
         assert!((contacts[0].depth_hit[0] - 0.1).abs() < 1e-4);
         assert!(contacts[0].normal[0] > 0.99);
         assert!(!contacts[1].is_contact());
+        for contact in &contacts[2..] {
+            assert!(contact.is_contact());
+            assert!((contact.point[1] - 0.2).abs() < 1e-5);
+            assert!((contact.point[2] + 0.15).abs() < 1e-5);
+        }
     }
 
     #[test]

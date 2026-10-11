@@ -39,7 +39,7 @@ fn mjcf_actuator_metadata_order_defaults_and_scalar_coordinates() {
     );
     assert_eq!(
         entries.iter().map(|a| a.coordinate).collect::<Vec<_>>(),
-        [1, 0, 1]
+        [Some(1), Some(0), Some(1)]
     );
     assert_eq!(
         entries[1].kind,
@@ -63,10 +63,15 @@ fn mjcf_actuator_general_defaults_inherit_and_child_kind_overrides() {
     assert_eq!(info.control_range, Some([-2.0, 2.0]));
     assert_eq!(info.force_range, Some([-3.0, 3.0]));
     let unsupported = xml.replace("kp=\"2\"", "dyntype=\"filter\"");
-    assert!(matches!(
-        load_mjcf_str(&unsupported, MjcfLoadOptions::default()),
-        Err(MjcfLoadError::Unsupported(_))
-    ));
+    let retained = load_mjcf_str(&unsupported, MjcfLoadOptions::default()).unwrap();
+    assert_eq!(
+        retained.actuators.entries()[0].kind,
+        MjcfActuatorKind::Unsupported
+    );
+    assert_eq!(
+        retained.actuators.entries()[0].attributes["dyntype"],
+        "filter"
+    );
 }
 
 #[test]
@@ -190,19 +195,25 @@ fn mjcf_actuator_damper_and_general_reference_branches() {
 }
 
 #[test]
-fn mjcf_actuator_unsupported_dynamics_are_typed_errors() {
+fn mjcf_actuator_unsupported_definitions_are_retained_and_undriven() {
     for actuator in [
         r#"<intvelocity joint="a"/>"#,
         r#"<muscle joint="a"/>"#,
         r#"<general joint="a" dyntype="filter"/>"#,
         r#"<general joint="a" gaintype="affine"/>"#,
         r#"<motor tendon="cable"/>"#,
+        r#"<motor site="attachment" refsite="reference"/>"#,
         r#"<motor joint="a" gear="1 2 0 0 0 0"/>"#,
     ] {
-        assert!(matches!(
-            load_mjcf_str(&model(actuator), MjcfLoadOptions::default()),
-            Err(MjcfLoadError::Unsupported(_))
-        ));
+        let mut loaded = load(actuator);
+        let info = &loaded.actuators.entries()[0];
+        assert_eq!(info.kind, MjcfActuatorKind::Unsupported);
+        assert!(info.unsupported_reason.is_some());
+        loaded.set_controls(&[f64::MAX]).unwrap();
+        assert_eq!(loaded.actuators.efforts(&loaded.world).unwrap(), [0.0, 0.0]);
+        loaded.step(0.01).unwrap();
+        assert_eq!(loaded.world.positions.as_slice(), [0.0, 0.0]);
+        assert_eq!(loaded.world.velocities.as_slice(), [0.0, 0.0]);
     }
     assert!(matches!(
         load_mjcf_str(
@@ -210,5 +221,99 @@ fn mjcf_actuator_unsupported_dynamics_are_typed_errors() {
             MjcfLoadOptions::default()
         ),
         Err(MjcfLoadError::Invalid(_))
+    ));
+}
+
+#[test]
+fn mjcf_actuator_nested_plugin_configuration_is_not_an_extra_control() {
+    let mut loaded = load(
+        r#"<plugin name="plugin_drive" plugin="example">
+        <config key="gain" value="100"/>
+        </plugin><motor joint="b"/>"#,
+    );
+    assert_eq!(loaded.actuators.entries().len(), 2);
+    assert_eq!(loaded.actuators.entries()[0].source_kind, "plugin");
+    assert_eq!(
+        loaded.actuators.entries()[0].attributes["plugin"],
+        "example"
+    );
+    assert_eq!(loaded.actuators.entries()[1].name, "actuator_1");
+    loaded.set_controls(&[100.0, 2.0]).unwrap();
+    assert_eq!(loaded.actuators.efforts(&loaded.world).unwrap(), [0.0, 2.0]);
+}
+
+#[test]
+fn mjcf_actuator_mixed_metadata_controls_and_native_drive() {
+    let xml = model(
+        r#"<motor name="drive" joint="b" gear="-2"/>
+        <muscle name="activation" joint="a" class="muscle"/>
+        <motor tendon="cable" gear="1 2 3 4 5 6"/>
+        <general joint="a" dyntype="filter" dynprm="0.25" actrange="0 1" actlimited="true"/>
+        <position name="servo" joint="a" kp="4" kv="2"/>"#,
+    )
+    .replace(
+        "<worldbody>",
+        r#"<default><default class="muscle">
+        <muscle timeconst="0.01 0.04" ctrlrange="0 1"/>
+        </default></default><worldbody>"#,
+    );
+    let mut loaded = load_mjcf_str(&xml, MjcfLoadOptions::default()).unwrap();
+    let entries = loaded.actuators.entries();
+    assert_eq!(
+        entries.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        ["drive", "activation", "actuator_2", "actuator_3", "servo"]
+    );
+    assert_eq!(entries[1].source_kind, "muscle");
+    assert_eq!(entries[1].attributes["timeconst"], "0.01 0.04");
+    assert_eq!(entries[1].control_range, Some([0.0, 1.0]));
+    assert_eq!(entries[2].attributes["tendon"], "cable");
+    assert_eq!(entries[2].attributes["gear"], "1 2 3 4 5 6");
+    assert_eq!(entries[2].coordinate, None);
+    assert_eq!(entries[3].attributes["dyntype"], "filter");
+    assert_eq!(entries[3].attributes["dynprm"], "0.25");
+    assert_eq!(entries[3].attributes["actrange"], "0 1");
+    assert_eq!(entries[3].attributes["actlimited"], "true");
+    assert!(entries[0].unsupported_reason.is_none());
+    assert!(entries[4].unsupported_reason.is_none());
+    let controls = [3.0, 100.0, 200.0, 300.0, 0.5];
+    loaded.set_controls(&controls).unwrap();
+    for invalid in [vec![1.0; 4], vec![3.0, f64::NAN, 200.0, 300.0, 0.5]] {
+        assert!(loaded.set_controls(&invalid).is_err());
+        assert_eq!(loaded.actuators.controls(), controls);
+    }
+    assert_eq!(
+        loaded.actuators.efforts(&loaded.world).unwrap(),
+        [2.0, -6.0]
+    );
+    let mut reference = load(r#"<motor joint="b" gear="-2"/><position joint="a" kp="4" kv="2"/>"#);
+    reference.set_controls(&[3.0, 0.5]).unwrap();
+    loaded.step(0.02).unwrap();
+    reference.step(0.02).unwrap();
+    assert_eq!(loaded.world.positions, reference.world.positions);
+    assert_eq!(loaded.world.velocities, reference.world.velocities);
+}
+
+#[test]
+fn mjcf_actuator_malformed_supported_definitions_still_fail() {
+    for actuator in [
+        r#"<motor joint="missing"/>"#,
+        r#"<motor joint="a" gear="NaN"/>"#,
+        r#"<position joint="a" kp="-1"/>"#,
+        r#"<velocity joint="a" kv="1 2"/>"#,
+        r#"<motor joint="a" ctrlrange="2 -1"/>"#,
+        r#"<motor joint="a" forcelimited="true"/>"#,
+        r#"<motor joint="a" ctrllimited="maybe"/>"#,
+    ] {
+        assert!(matches!(
+            load_mjcf_str(&model(actuator), MjcfLoadOptions::default()),
+            Err(MjcfLoadError::Invalid(_))
+        ));
+    }
+    assert!(matches!(
+        load_mjcf_str(
+            &model(r#"<damper joint="a" gainprm="-1"/>"#),
+            MjcfLoadOptions::default()
+        ),
+        Err(MjcfLoadError::Unsupported(_))
     ));
 }

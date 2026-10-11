@@ -2843,6 +2843,9 @@ pub struct GpuArticulatedGroundContactBatch {
     mass_status: wgpu::Buffer,
 }
 
+#[path = "gpu_scene_contact_reset.rs"]
+pub(crate) mod scene_reset;
+
 impl GpuArticulatedGroundContactBatch {
     /// Update native penetration recovery and cached-impulse damping.
     ///
@@ -2852,8 +2855,30 @@ impl GpuArticulatedGroundContactBatch {
         queue: &wgpu::Queue,
         policy: crate::gpu_contact_policy::GpuContactPolicy,
     ) -> Result<(), GpuArticulatedGroundContactError> {
-        let values = policy.packed()?;
+        let values = policy
+            .packed()
+            .ok_or(GpuArticulatedGroundContactError::InvalidInput)?;
+        let dt = self.timestep as f32;
+        if [
+            policy.dynamic_normal.cfm,
+            policy.static_normal.cfm,
+            policy.loop_constraint.cfm,
+            policy.coupling_constraint.cfm,
+            policy.fixed_loop_constraint.cfm,
+        ]
+        .iter()
+        .any(|cfm| !(*cfm / dt).is_finite())
+        {
+            return Err(GpuArticulatedGroundContactError::InvalidInput);
+        }
         queue.write_buffer(&self.solver_policy, 0, bytemuck::cast_slice(&values));
+        for row in 0..self.sphere_count {
+            queue.write_buffer(
+                &self.spheres,
+                (row * size_of::<PackedSphere>() + offset_of!(PackedSphere, impulses)) as u64,
+                bytemuck::cast_slice(&[0.0f32; 8]),
+            );
+        }
         Ok(())
     }
 
@@ -7278,7 +7303,7 @@ impl GpuArticulatedGroundContactBatch {
                         0.0,
                     ],
                     plane: [a4?, 0.0, 0.0, 0.0],
-                    material: [0.2, dt, 2.0, 78.0],
+                    material: [0.0, dt, 0.0, 78.0],
                     ..PackedSphere::zeroed()
                 });
             }
@@ -7371,7 +7396,13 @@ impl GpuArticulatedGroundContactBatch {
                         first_axis_end: packed_quat(rotation_a)?,
                         second_axis_end: packed_quat(rotation_b)?,
                         plane: axis,
-                        material: [0.2, dt, 2.0, if component < 3 { 79.0 } else { 80.0 }],
+                        // Both linear and angular fixed rows share the fixed compliance family.
+                        material: [
+                            if fixed { 1.0 } else { 0.0 },
+                            dt,
+                            2.0,
+                            if component < 3 { 79.0 } else { 80.0 },
+                        ],
                         ..PackedSphere::zeroed()
                     });
                 }
@@ -8056,7 +8087,9 @@ impl GpuArticulatedGroundContactBatch {
             solver_policy: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Tessera resident contact policy"),
                 contents: bytemuck::cast_slice(
-                    &crate::gpu_contact_policy::GpuContactPolicy::default().packed()?,
+                    &crate::gpu_contact_policy::GpuContactPolicy::default()
+                        .packed()
+                        .ok_or(GpuArticulatedGroundContactError::InvalidInput)?,
                 ),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             }),
@@ -12074,6 +12107,7 @@ impl GpuArticulatedGroundContactBatch {
                 &preparation.positions,
                 &self.state_status,
                 &preparation.indices,
+                &self.solver_policy,
             ];
             let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Tessera articulated coupling bindings"),

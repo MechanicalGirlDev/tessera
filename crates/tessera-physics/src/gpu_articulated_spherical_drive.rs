@@ -1,6 +1,8 @@
 //! Quaternion spherical drives assembled directly from resident state.
 
+use crate::articulated_world::MotorModel;
 use crate::gpu_articulated_force::GpuArticulatedForceBatch;
+use crate::gpu_articulated_mass_assembly::GpuArticulatedMassAssemblyBatch;
 use crate::gpu_articulated_spherical::GpuArticulatedSphericalBatch;
 use crate::gpu_articulated_state::GpuGeneralizedStateBatch;
 use crate::spherical_drive::SphericalJointDrive;
@@ -45,6 +47,9 @@ pub struct GpuArticulatedSphericalDriveBatch {
     status: wgpu::Buffer,
     mass_status: wgpu::Buffer,
     output: wgpu::Buffer,
+    inverse_mass: wgpu::Buffer,
+    inverse_indices: wgpu::Buffer,
+    has_inverse_mass: bool,
     layouts: Vec<Vec<[u32; 4]>>,
     count: usize,
 }
@@ -61,7 +66,37 @@ impl GpuArticulatedSphericalDriveBatch {
         forces: &GpuArticulatedForceBatch,
         drives: &[Vec<Option<SphericalJointDrive>>],
     ) -> Result<Self, GpuSphericalDriveError> {
+        Self::build(state, spherical, forces, drives, None)
+    }
+
+    /// Bind the full native inverse mass matrix for acceleration-based motors.
+    /// Encode native mass with inverse before this pass, without implicit passive
+    /// tangents. Force caps remain physical torque in both models.
+    pub fn new_with_mass(
+        state: &GpuGeneralizedStateBatch,
+        spherical: &GpuArticulatedSphericalBatch,
+        forces: &GpuArticulatedForceBatch,
+        drives: &[Vec<Option<SphericalJointDrive>>],
+        mass: &GpuArticulatedMassAssemblyBatch,
+    ) -> Result<Self, GpuSphericalDriveError> {
+        Self::build(state, spherical, forces, drives, Some(mass))
+    }
+
+    fn build(
+        state: &GpuGeneralizedStateBatch,
+        spherical: &GpuArticulatedSphericalBatch,
+        forces: &GpuArticulatedForceBatch,
+        drives: &[Vec<Option<SphericalJointDrive>>],
+        mass: Option<&GpuArticulatedMassAssemblyBatch>,
+    ) -> Result<Self, GpuSphericalDriveError> {
         if !spherical.matches_source(state)
+            || mass.is_some_and(|mass| mass.dimensions() != forces.dimensions())
+            || (mass.is_none()
+                && drives
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(|drive| drive.model == MotorModel::AccelerationBased))
             || forces.dimensions().len() != state.ranges().len()
             || forces
                 .dimensions()
@@ -104,7 +139,7 @@ impl GpuArticulatedSphericalDriveBatch {
             || bytes > limits.max_buffer_size
             || bytes > u64::from(limits.max_storage_buffer_binding_size)
             || packed.len().div_ceil(64) > limits.max_compute_workgroups_per_dimension as usize
-            || limits.max_storage_buffers_per_shader_stage < 6
+            || limits.max_storage_buffers_per_shader_stage < 8
         {
             return Err(GpuSphericalDriveError::Capacity);
         }
@@ -135,6 +170,43 @@ impl GpuArticulatedSphericalDriveBatch {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let inverse_mass = mass.map_or_else(
+            || {
+                state
+                    .device()
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Tessera force-only spherical unused inverse"),
+                        contents: bytemuck::bytes_of(&0.0f32),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            },
+            |mass| mass.inverse_buffer_or_init().clone(),
+        );
+        let inverse_indices = layouts
+            .iter()
+            .flatten()
+            .map(|layout| {
+                let environment = layout[1] as usize;
+                let range = &state.ranges()[environment];
+                let slot = layout[0] as usize - range.start;
+                let stride = range.len() + 1;
+                let diagonal = mass.map_or(0, |mass| {
+                    mass.inverse_ranges()[environment].start + slot * stride
+                });
+                Ok([
+                    u32::try_from(diagonal).map_err(|_| GpuSphericalDriveError::Capacity)?,
+                    u32::try_from(stride).map_err(|_| GpuSphericalDriveError::Capacity)?,
+                ])
+            })
+            .collect::<Result<Vec<_>, GpuSphericalDriveError>>()?;
+        let inverse_indices =
+            state
+                .device()
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Tessera spherical drive inverse indices"),
+                    contents: bytemuck::cast_slice(&inverse_indices),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
         Ok(Self {
             device: state.device().clone(),
             queue: state.queue().clone(),
@@ -145,6 +217,9 @@ impl GpuArticulatedSphericalDriveBatch {
             status: state.status_buffer().clone(),
             mass_status: state.mass_status_buffer().clone(),
             output: forces.base_force_buffer().clone(),
+            inverse_mass,
+            inverse_indices,
+            has_inverse_mass: mass.is_some(),
             layouts,
             count: packed.len(),
         })
@@ -155,6 +230,15 @@ impl GpuArticulatedSphericalDriveBatch {
         &self,
         drives: &[Vec<Option<SphericalJointDrive>>],
     ) -> Result<(), GpuSphericalDriveError> {
+        if !self.has_inverse_mass
+            && drives
+                .iter()
+                .flatten()
+                .flatten()
+                .any(|drive| drive.model == MotorModel::AccelerationBased)
+        {
+            return Err(GpuSphericalDriveError::InvalidInput);
+        }
         let packed = pack(&self.layouts, drives)?;
         self.queue
             .write_buffer(&self.parameters, 0, bytemuck::cast_slice(&packed));
@@ -170,6 +254,8 @@ impl GpuArticulatedSphericalDriveBatch {
             &self.status,
             &self.mass_status,
             &self.output,
+            &self.inverse_mass,
+            &self.inverse_indices,
         ];
         let entries = buffers
             .iter()
@@ -231,9 +317,17 @@ fn pack(
                 entry.velocity[i] = narrow(drive.velocity_target[i])?;
                 entry.stiffness[i] = narrow(drive.stiffness[i])?;
                 entry.damping[i] = narrow(drive.damping[i])?;
-                entry.cap[i] = narrow(drive.max_torque[i])?;
+                entry.cap[i] = if drive.max_torque[i] == f64::INFINITY {
+                    -1.0
+                } else {
+                    narrow(drive.max_torque[i])?
+                };
             }
-            entry.indices[3] = 1;
+            entry.indices[3] = if drive.model == MotorModel::AccelerationBased {
+                2
+            } else {
+                1
+            };
         }
         result.push(entry);
     }
@@ -256,6 +350,7 @@ mod tests {
     fn packed_quaternion_drives_match_cpu_and_validate_updates() {
         let q = UnitQuaternion::from_euler_angles(0.3, core::f64::consts::FRAC_PI_2, -0.5);
         let drive = SphericalJointDrive {
+            model: MotorModel::ForceBased,
             orientation_target: UnitQuaternion::from_scaled_axis(Vector3::new(0.2, -0.3, 0.1)) * q,
             velocity_target: Vector3::new(-0.2, 0.1, 0.3),
             stiffness: Vector3::new(10.0, 20.0, 30.0),

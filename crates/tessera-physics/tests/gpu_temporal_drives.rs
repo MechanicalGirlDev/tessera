@@ -107,6 +107,7 @@ fn drive_impulses_and_soft_limits_match_expected_motion_on_free_axes()
             world.reset(&[fixed, moving])?;
             let origin = if revolute { 0.0 } else { 5.0 };
             let servo = GpuRigidAxisServo {
+                model: tessera_physics::articulated_world::MotorModel::ForceBased,
                 position_target: origin + 1.0,
                 velocity_target: 0.0,
                 stiffness: 100.0,

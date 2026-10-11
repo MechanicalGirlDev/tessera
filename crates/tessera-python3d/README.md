@@ -15,6 +15,38 @@ Set `TESSERA_WHEEL_PROFILE=debug` at build time for a shorter development build.
 
 ## Usage
 
+The [Nexus contract coverage](../../docs/nexus-physics.md) records the native
+implementation and its limits. `JointMotor` and `GpuAxisServo` accept
+`model=MotorModel.ACCELERATION_BASED`; their default is `FORCE_BASED`.
+Caps accept `float("inf")` to disable the physical force/torque limit.
+Rigid worlds and batches expose `gravity`, `set_gravity`, `solve_parameters`
+and `set_solve_parameters(GpuSolveParameters(...))`; CPU sphere worlds expose
+the gravity methods.
+
+`simulation_state` includes joint velocities, root pose/twist and explicit
+spherical orientations. `set_simulation_state` applies the entire state
+atomically; `set_configuration` teleports and zeros velocities. `snapshot` and
+`restore_snapshot` include physical descriptors and held imported controls.
+After resident stepping, `snapshot_gpu_resident` captures full scene templates
+on the GPU. `restore_gpu_resident(template)` restores a single world;
+`ArticulatedBatch.restore_gpu_resident(template, [environment, ...])` restores
+only selected original slots, preserving unselected resident state.
+
+MJCF single and batch worlds expose `actuator_info`, `actuator_names`, `controls`,
+`set_controls`, `step_controls` and `step_controls_gpu_resident`. Batch methods
+take an environment index where appropriate. Resident stepping evaluates
+feedback from current state every microstep. Unsupported actuator entries retain
+their source kind, attributes and reason, and apply no force.
+
+`UrdfOptions` selects collision/visual geometry, mass import, scale/shift,
+adjacency collision and convex/indexed mesh policy. Pass it to
+`from_urdf_with_options` or `BatchModel.urdf_options`. `MeshAsset` accepts
+`indexed_parts=[IndexedMeshPart(vertices=..., triangles=...), ...]` for
+`convex_hull=False`; `indexed_parts` defaults to an empty list. `joints`,
+`joint_components` and batch `joint_metadata` retain source identity, physical
+link mapping, effort/velocity limits and mimic metadata.
+See [examples/nexus_contracts.py](examples/nexus_contracts.py).
+
 Zero-mass GPU bodies can follow a prescribed velocity through `set_kinematic_motion`.
 A single world takes `(body_index, GpuKinematicMotion(linear=Vec3(...), angular=Vec3(...)))`,
 and a batch takes `(environment_index, body_index, motion)`. `motion=None` zeroes the
@@ -166,7 +198,7 @@ External collision meshes are passed through `ArticulatedWorld.from_urdf_with_me
 
 `set_implicit_coriolis(enabled)` on articulated worlds and batches toggles whether Coriolis and centrifugal forces are evaluated iteratively at the midpoint velocity. On a batch, pass the environment index as the first argument. It's enabled by default. When disabled, the bias evaluated at the current velocity is used for that substep. The setting is included in snapshots and environment reset templates.
 
-`ArticulatedWorld.set_self_contacts_enabled(enabled)` toggles self-contact between non-adjacent links. On `ArticulatedBatch`, pass the environment index as the first argument. It's enabled by default, and contacts within the same link or between adjacent links are always excluded. The setting is saved in snapshots and per-environment reset templates, and doesn't affect contacts with scene bodies.
+`ArticulatedWorld.set_self_contacts_enabled(enabled)` toggles articulated self-contact. On `ArticulatedBatch`, pass the environment index as the first argument. It's enabled by default. Same-link contacts and explicit collision exclusions remain excluded; adjacent-link contacts default to disabled and can be enabled with `set_joint_contacts_enabled` or `UrdfOptions.enable_joint_collisions`. These settings are saved in snapshots and per-environment reset templates, and do not disable contacts with scene bodies.
 
 The CPU `SphereWorld` and the GPU sphere and mixed-shape worlds / batches can cap the linear speed of dynamic bodies in m/s with `set_max_linear_speed(Some(value))`. `None` removes the cap. The CPU accepts an f64 limit and the GPU an f32 limit. On a batch, the cap is shared by all environments. Speed is clamped during integration and after contact and joint impulses, and static body velocities aren't changed.
 

@@ -10,6 +10,15 @@ Vendor-neutral 3D rigid-body and Material Point Method physics.
   optional rigid-body coupling.
 - `tessera-python3d`: UniFFI bindings and a platform-specific `tessera3d` Python wheel.
 
+## Nexus physics contracts
+
+The native CPU, WebGPU and UniFFI implementations cover the contracts recorded in
+[`docs/nexus-physics.md`](docs/nexus-physics.md). The comparison pins Nexus at
+`ca2cc91`; it describes API and physical-model coverage, not numerical identity
+between Tessera's native solver and Rapier. The document includes motor models,
+compliant constraints, prescribed coordinates, indexed URDF meshes, full scene
+resets, imported actuator feedback and MPM controls.
+
 ## Reiny 0.8 integration
 
 All three crates remain independent of Reiny: `tessera-physics` owns rigid-body

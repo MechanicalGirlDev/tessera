@@ -495,7 +495,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let witness_b = farthest(b, -best.xyz);
     let midpoint = (a.center.xyz + b.center.xyz) * 0.5;
     let witness_midpoint = (witness_a + witness_b) * 0.5;
-    let point = midpoint + best.xyz * dot(witness_midpoint - midpoint, best.xyz);
+    var point = midpoint + best.xyz * dot(witness_midpoint - midpoint, best.xyz);
+    if (a.axis_kind.w == 0.0 && a.ranges.y == 1u && a.center.w > 0.0) {
+        point = witness_a + best.xyz * dot(witness_midpoint - witness_a, best.xyz);
+    } else if (b.axis_kind.w == 0.0 && b.ranges.y == 1u && b.center.w > 0.0) {
+        point = witness_b + best.xyz * dot(witness_midpoint - witness_b, best.xyz);
+    }
     contacts[id.x] = Contact(
         vec4<f32>(point, f32(selected_a)),
         vec4<f32>(best.xyz, f32(selected_b)),

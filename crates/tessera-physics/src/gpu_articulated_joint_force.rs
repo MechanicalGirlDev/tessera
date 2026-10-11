@@ -5,8 +5,9 @@ use core::mem::size_of;
 use nalgebra::DVector;
 use wgpu::util::DeviceExt;
 
-use crate::articulated_world::{JointMotor, JointNonlinearPassive, JointPassive};
+use crate::articulated_world::{JointMotor, JointNonlinearPassive, JointPassive, MotorModel};
 use crate::gpu_articulated_force::GpuArticulatedForceBatch;
+use crate::gpu_articulated_mass_assembly::GpuArticulatedMassAssemblyBatch;
 use crate::gpu_articulated_state::GpuGeneralizedStateBatch;
 
 #[repr(C)]
@@ -76,6 +77,7 @@ pub struct GpuArticulatedJointForceBatch {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    prepare_mass_pipeline: wgpu::ComputePipeline,
     parameters: wgpu::Buffer,
     positions: wgpu::Buffer,
     velocities: wgpu::Buffer,
@@ -83,6 +85,8 @@ pub struct GpuArticulatedJointForceBatch {
     status: wgpu::Buffer,
     output: wgpu::Buffer,
     vectors: wgpu::Buffer,
+    inverse_mass: wgpu::Buffer,
+    has_inverse_mass: bool,
     implicit: Option<ImplicitSettings>,
     dimensions: Vec<usize>,
     coordinate_count: usize,
@@ -93,13 +97,43 @@ impl GpuArticulatedJointForceBatch {
         &self.parameters
     }
 
+    /// Native armature baseline retained by subsequent joint parameter uploads.
+    pub(crate) fn reset_armature(&self) -> Option<&[f32]> {
+        self.implicit
+            .as_ref()
+            .map(|settings| settings.armature.as_slice())
+    }
+
+    /// Restore selected host baselines from a compatible owner reset snapshot.
+    /// The owner validates snapshot shape and indices before changing GPU or host state.
+    pub(crate) fn restore_reset_armature(&mut self, armature: &[f32], environments: &[usize]) {
+        if let Some(settings) = &mut self.implicit {
+            for &environment in environments {
+                let start = self.dimensions[..environment].iter().sum::<usize>();
+                let end = start + self.dimensions[environment];
+                settings.armature[start..end].copy_from_slice(&armature[start..end]);
+            }
+        }
+    }
+
     /// Bind matching state and force batches with one parameter per coordinate.
     pub fn new(
         state: &GpuGeneralizedStateBatch,
         forces: &GpuArticulatedForceBatch,
         inputs: &[Vec<GpuJointForceInput>],
     ) -> Result<Self, GpuArticulatedJointForceError> {
-        Self::build(state, forces, inputs, None)
+        Self::build(state, forces, inputs, None, None)
+    }
+
+    /// Bind native inverse mass for acceleration-based gains. Before each force
+    /// evaluation, encode native mass assembly with inverse at the current pose.
+    pub fn new_with_mass(
+        state: &GpuGeneralizedStateBatch,
+        forces: &GpuArticulatedForceBatch,
+        inputs: &[Vec<GpuJointForceInput>],
+        mass: &GpuArticulatedMassAssemblyBatch,
+    ) -> Result<Self, GpuArticulatedJointForceError> {
+        Self::build(state, forces, inputs, None, Some(mass))
     }
 
     /// Bind an implicit contact substep with baseline armature and positive step time.
@@ -113,6 +147,30 @@ impl GpuArticulatedJointForceBatch {
         inputs: &[Vec<GpuJointForceInput>],
         armature: &[DVector<f64>],
         dt: f64,
+    ) -> Result<Self, GpuArticulatedJointForceError> {
+        Self::build_implicit(state, forces, inputs, armature, dt, None)
+    }
+
+    /// Implicit passive forces with native inverse inertia for acceleration drives.
+    /// Encode `encode_prepare_mass`, then `mass.encode_with_inverse`, then `encode`.
+    pub fn new_implicit_with_mass(
+        state: &GpuGeneralizedStateBatch,
+        forces: &GpuArticulatedForceBatch,
+        inputs: &[Vec<GpuJointForceInput>],
+        armature: &[DVector<f64>],
+        dt: f64,
+        mass: &GpuArticulatedMassAssemblyBatch,
+    ) -> Result<Self, GpuArticulatedJointForceError> {
+        Self::build_implicit(state, forces, inputs, armature, dt, Some(mass))
+    }
+
+    fn build_implicit(
+        state: &GpuGeneralizedStateBatch,
+        forces: &GpuArticulatedForceBatch,
+        inputs: &[Vec<GpuJointForceInput>],
+        armature: &[DVector<f64>],
+        dt: f64,
+        mass: Option<&GpuArticulatedMassAssemblyBatch>,
     ) -> Result<Self, GpuArticulatedJointForceError> {
         let dimensions = forces.dimensions();
         if !dt.is_finite() || dt <= 0.0 || armature.len() != dimensions.len() {
@@ -147,6 +205,7 @@ impl GpuArticulatedJointForceBatch {
                 armature: packed_armature,
                 vector_offsets,
             }),
+            mass,
         )
     }
 
@@ -155,8 +214,19 @@ impl GpuArticulatedJointForceBatch {
         forces: &GpuArticulatedForceBatch,
         inputs: &[Vec<GpuJointForceInput>],
         implicit: Option<ImplicitSettings>,
+        mass: Option<&GpuArticulatedMassAssemblyBatch>,
     ) -> Result<Self, GpuArticulatedJointForceError> {
         let dimensions = forces.dimensions().to_vec();
+        if mass.is_some_and(|mass| mass.dimensions() != dimensions)
+            || (mass.is_none()
+                && inputs.iter().flatten().any(|input| {
+                    input
+                        .motor
+                        .is_some_and(|motor| motor.model == MotorModel::AccelerationBased)
+                }))
+        {
+            return Err(GpuArticulatedJointForceError::InvalidInput);
+        }
         let parameters = pack_inputs(&dimensions, inputs, implicit.as_ref())?;
         if state.ranges().len() != dimensions.len()
             || state
@@ -169,10 +239,15 @@ impl GpuArticulatedJointForceBatch {
         }
         let mut owners = Vec::with_capacity(parameters.len());
         for (system, range) in state.ranges().iter().enumerate() {
-            owners.extend(core::iter::repeat_n(
-                u32::try_from(system).map_err(|_| GpuArticulatedJointForceError::Capacity)?,
-                range.len(),
-            ));
+            for coordinate in 0..range.len() {
+                let diagonal = mass.map_or(0, |mass| {
+                    mass.inverse_ranges()[system].start + coordinate * (range.len() + 1)
+                });
+                owners.push([
+                    u32::try_from(system).map_err(|_| GpuArticulatedJointForceError::Capacity)?,
+                    u32::try_from(diagonal).map_err(|_| GpuArticulatedJointForceError::Capacity)?,
+                ]);
+            }
         }
         let count = parameters.len();
         let device = state.device();
@@ -181,15 +256,15 @@ impl GpuArticulatedJointForceBatch {
             .checked_mul(size_of::<PackedJointForce>())
             .ok_or(GpuArticulatedJointForceError::Capacity)? as u64;
         let owner_bytes = count
-            .checked_mul(size_of::<u32>())
+            .checked_mul(size_of::<[u32; 2]>())
             .ok_or(GpuArticulatedJointForceError::Capacity)? as u64;
-        if owner_bytes != forces.base_force_buffer().size()
+        if owner_bytes / 2 != forces.base_force_buffer().size()
             || [param_bytes, owner_bytes].into_iter().any(|bytes| {
                 bytes > limits.max_buffer_size
                     || bytes > u64::from(limits.max_storage_buffer_binding_size)
             })
             || count.div_ceil(64) > limits.max_compute_workgroups_per_dimension as usize
-            || limits.max_storage_buffers_per_shader_stage < 7
+            || limits.max_storage_buffers_per_shader_stage < 8
         {
             return Err(GpuArticulatedJointForceError::Capacity);
         }
@@ -219,10 +294,30 @@ impl GpuArticulatedJointForceBatch {
             compilation_options: Default::default(),
             cache: None,
         });
+        let prepare_mass_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Tessera restore native drive inertia"),
+                layout: None,
+                module: &module,
+                entry_point: Some("prepare_native_mass"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let inverse_mass = mass.map_or_else(
+            || {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Tessera force-only drive unused inverse"),
+                    contents: bytemuck::bytes_of(&0.0f32),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            },
+            |mass| mass.inverse_buffer_or_init().clone(),
+        );
         Ok(Self {
             device: device.clone(),
             queue: state.queue().clone(),
             pipeline,
+            prepare_mass_pipeline,
             parameters,
             positions: state.position_buffer().clone(),
             velocities: state.velocity_buffer().clone(),
@@ -230,6 +325,8 @@ impl GpuArticulatedJointForceBatch {
             status: state.status_buffer().clone(),
             output: forces.base_force_buffer().clone(),
             vectors: forces.vectors_buffer().clone(),
+            inverse_mass,
+            has_inverse_mass: mass.is_some(),
             implicit,
             dimensions,
             coordinate_count: count,
@@ -241,6 +338,15 @@ impl GpuArticulatedJointForceBatch {
         &self,
         inputs: &[Vec<GpuJointForceInput>],
     ) -> Result<(), GpuArticulatedJointForceError> {
+        if !self.has_inverse_mass
+            && inputs.iter().flatten().any(|input| {
+                input
+                    .motor
+                    .is_some_and(|motor| motor.model == MotorModel::AccelerationBased)
+            })
+        {
+            return Err(GpuArticulatedJointForceError::InvalidInput);
+        }
         let packed = pack_inputs(&self.dimensions, inputs, self.implicit.as_ref())?;
         self.queue
             .write_buffer(&self.parameters, 0, bytemuck::cast_slice(&packed));
@@ -257,6 +363,7 @@ impl GpuArticulatedJointForceBatch {
             &self.status,
             &self.output,
             &self.vectors,
+            &self.inverse_mass,
         ];
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Tessera articulated joint force bindings"),
@@ -275,6 +382,35 @@ impl GpuArticulatedJointForceBatch {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(self.coordinate_count.div_ceil(64) as u32, 1, 1);
+    }
+
+    /// Restore baseline armature before computing native inverse inertia.
+    /// This removes the previous substep's implicit spring/damping tangents.
+    pub fn encode_prepare_mass(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.implicit.is_none() {
+            return;
+        }
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Tessera native drive inertia bindings"),
+            layout: &self.prepare_mass_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.parameters.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.vectors.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Tessera restore native drive inertia"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.prepare_mass_pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(self.coordinate_count.div_ceil(64) as u32, 1, 1);
     }
@@ -307,7 +443,11 @@ fn pack_inputs(
                     [
                         finite_f32(motor.position_target.unwrap_or(0.0))?,
                         finite_f32(motor.velocity_target)?,
-                        finite_f32(motor.max_force)?,
+                        if motor.max_force == f64::INFINITY {
+                            -1.0
+                        } else {
+                            finite_f32(motor.max_force)?
+                        },
                         1.0,
                     ],
                     [
@@ -318,7 +458,11 @@ fn pack_inputs(
                         } else {
                             0.0
                         },
-                        0.0,
+                        if motor.model == MotorModel::AccelerationBased {
+                            1.0
+                        } else {
+                            0.0
+                        },
                     ],
                 )
             } else {
@@ -425,6 +569,7 @@ mod tests {
                     damping_cubic: 0.1,
                 },
                 motor: Some(JointMotor {
+                    model: MotorModel::ForceBased,
                     position_target: Some(0.5),
                     velocity_target: 0.2,
                     stiffness: 10.0,
@@ -436,6 +581,7 @@ mod tests {
                 GpuJointForceInput {
                     base_force: -0.75,
                     motor: Some(JointMotor {
+                        model: MotorModel::ForceBased,
                         position_target: None,
                         velocity_target: -1.0,
                         stiffness: 20.0,
@@ -453,12 +599,9 @@ mod tests {
                 continue;
             };
             tested += 1;
-            let mass = crate::gpu_articulated_mass_assembly::GpuArticulatedMassAssemblyBatch::new(
-                context.device(),
-                context.queue(),
-                &systems,
-            )
-            .unwrap();
+            let mass =
+                GpuArticulatedMassAssemblyBatch::new(context.device(), context.queue(), &systems)
+                    .unwrap();
             let state = GpuGeneralizedStateBatch::from_assembly_batch(&mass, &states).unwrap();
             let forces = GpuArticulatedForceBatch::new(
                 &mass,
@@ -516,6 +659,7 @@ mod tests {
                 rest_position: 0.0,
             },
             motor: Some(JointMotor {
+                model: MotorModel::ForceBased,
                 position_target: Some(0.5),
                 velocity_target: 0.0,
                 stiffness: 4.0,
@@ -530,7 +674,7 @@ mod tests {
                 continue;
             };
             tested += 1;
-            let mass = crate::gpu_articulated_mass_assembly::GpuArticulatedMassAssemblyBatch::new(
+            let mass = GpuArticulatedMassAssemblyBatch::new(
                 context.device(),
                 context.queue(),
                 core::slice::from_ref(&system),
@@ -604,6 +748,7 @@ mod tests {
                         damping_cubic: 0.1,
                     },
                     motor: Some(JointMotor {
+                        model: MotorModel::ForceBased,
                         position_target: Some(0.2),
                         velocity_target: 0.0,
                         stiffness: 2.0,
@@ -665,12 +810,9 @@ mod tests {
                 continue;
             };
             tested += 1;
-            let mass = crate::gpu_articulated_mass_assembly::GpuArticulatedMassAssemblyBatch::new(
-                context.device(),
-                context.queue(),
-                &systems,
-            )
-            .unwrap();
+            let mass =
+                GpuArticulatedMassAssemblyBatch::new(context.device(), context.queue(), &systems)
+                    .unwrap();
             let state = GpuGeneralizedStateBatch::from_assembly_batch(&mass, &states).unwrap();
             let forces = GpuArticulatedForceBatch::new(
                 &mass,

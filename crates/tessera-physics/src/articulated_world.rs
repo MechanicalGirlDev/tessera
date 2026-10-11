@@ -6,6 +6,9 @@ use std::sync::Arc;
 use nalgebra::{DMatrix, DVector, Isometry3, Matrix3, Point3, UnitQuaternion, Vector3};
 
 use crate::articulation::{Articulation, ArticulationError, ArticulationPose};
+
+#[path = "world_state.rs"]
+mod simulation_state;
 use crate::contact_reference::{
     ContactConstraint, ContactImpulse, ContactProblem, ContactSolution, ContactSolveError,
     SolveParams, solve_contacts,
@@ -67,7 +70,11 @@ use crate::material::{ColliderMaterial, CombinedMaterial};
 use crate::mesh::{
     HeightFieldGeometry, PolylineGeometry, TRIANGLE_HALF_THICKNESS, TriangleMeshGeometry,
 };
+use crate::prescribed_dof::{
+    ArticulatedConstraintPolicy, ConstraintCompliance, add_compliant_rows, solve_prescribed_mass,
+};
 use crate::sleep::{SleepSettings, SleepState};
+pub use simulation_state::ArticulatedSimulationState;
 
 /// One spherical collision shape attached to an articulated link.
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +155,29 @@ pub struct LinkConvex {
     pub origin: Isometry3<f64>,
     /// Vertices and topology in the hull frame.
     pub geometry: ConvexGeometry,
+}
+
+/// An indexed triangle surface rigidly attached to a link.
+///
+/// Contact uses the same per-triangle thickness as scene meshes; triangles are
+/// never replaced with a hull of the complete mesh. Both CPU and resident GPU
+/// contacts retain the owning link for every triangle primitive.
+/// Resident preparation expands triangles into contact primitives, without a
+/// whole-mesh hull or a moving-mesh BVH.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkTriangleMesh {
+    /// Owning link index.
+    pub link: usize,
+    /// Mesh frame in link coordinates.
+    pub origin: Isometry3<f64>,
+    /// Validated vertices and triangle indices in the mesh frame.
+    pub geometry: TriangleMeshGeometry,
+}
+
+struct LinkConvexRef<'a> {
+    link: usize,
+    origin: Isometry3<f64>,
+    geometry: &'a ConvexGeometry,
 }
 
 #[cfg(feature = "gpu-contact")]
@@ -693,14 +723,15 @@ fn append_bilateral_error_row(
     inverse_mass: &DMatrix<f64>,
     dt: f64,
     solve_params: SolveParams,
-    contacts: &mut Vec<ContactConstraint>,
-    warm_start: &mut Vec<ContactImpulse>,
+    cfm: f64,
+    rows: (&mut Vec<ContactConstraint>, &mut Vec<ContactImpulse>),
 ) -> Result<(), ArticulatedWorldError> {
+    let (contacts, warm_start) = rows;
     let effective_inverse_mass = axis.dot(&(inverse_mass * &axis));
     if !effective_inverse_mass.is_finite() {
         return Err(ArticulatedWorldError::NumericalInstability);
     }
-    if effective_inverse_mass <= 1e-12 {
+    if effective_inverse_mass <= 1e-12 && cfm == 0.0 {
         if error.abs() > 1e-9 {
             return Err(ContactSolveError::SingularContact.into());
         }
@@ -1238,18 +1269,31 @@ pub enum ArticulatedWorldError {
     GpuMass(#[from] crate::gpu_articulated_mass::GpuArticulatedMassError),
 }
 
+/// Units used by proportional and derivative motor gains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MotorModel {
+    /// Gains produce physical force or torque.
+    #[default]
+    ForceBased,
+    /// Gains produce acceleration, normalized by the projected inverse inertia.
+    AccelerationBased,
+}
+
 /// Per-coordinate position and velocity drive, with a motor-only effort cap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JointMotor {
+    /// Whether gains produce physical effort or acceleration.
+    pub model: MotorModel,
     /// Desired generalized position. None selects velocity-only control.
     pub position_target: Option<f64>,
     /// Desired generalized velocity in radians/s or m/s.
     pub velocity_target: f64,
-    /// Position error gain in generalized force per coordinate.
+    /// Position error gain in effort or acceleration per coordinate.
     pub stiffness: f64,
-    /// Velocity error gain in generalized force per coordinate speed.
+    /// Velocity error gain in effort or acceleration per coordinate speed.
     pub damping: f64,
-    /// Maximum absolute motor force or torque. External input is not capped.
+    /// Maximum absolute physical force or torque; positive infinity is unbounded.
+    /// External input is not capped, regardless of the motor model.
     pub max_force: f64,
 }
 
@@ -1261,14 +1305,30 @@ impl JointMotor {
             && self.stiffness >= 0.0
             && self.damping.is_finite()
             && self.damping >= 0.0
-            && self.max_force.is_finite()
+            && !self.max_force.is_nan()
             && self.max_force >= 0.0
     }
 
-    fn force(self, position: f64, velocity: f64) -> Option<f64> {
+    /// Evaluate physical effort using `J M^-1 J^T` for this coordinate's row.
+    /// In an articulation this is a diagonal of the full inverse mass matrix,
+    /// not the reciprocal of a diagonal of the mass matrix.
+    pub fn force(self, position: f64, velocity: f64, inverse_mass: f64) -> Option<f64> {
+        if !self.is_valid() || !position.is_finite() || !velocity.is_finite() {
+            return None;
+        }
         let position_error = self.position_target.map_or(0.0, |target| target - position);
-        let value =
+        let mut value =
             self.stiffness * position_error + self.damping * (self.velocity_target - velocity);
+        if self.model == MotorModel::AccelerationBased {
+            if !inverse_mass.is_finite() || inverse_mass < 0.0 {
+                return None;
+            }
+            value = if inverse_mass == 0.0 {
+                0.0
+            } else {
+                value / inverse_mass
+            };
+        }
         value
             .is_finite()
             .then(|| value.clamp(-self.max_force, self.max_force))
@@ -1591,6 +1651,13 @@ impl LinkExternalLoad {
 /// included because their topology may change at runtime.
 #[derive(Debug, Clone)]
 pub struct ArticulatedWorldSnapshot {
+    articulation: Articulation,
+    params: ArticulatedWorldParams,
+    floating: bool,
+    joint_contacts_enabled: bool,
+    prescribed_coordinates: Vec<bool>,
+    constraint_policy: ArticulatedConstraintPolicy,
+    limit_compliance: Vec<ConstraintCompliance>,
     positions: DVector<f64>,
     velocities: DVector<f64>,
     spherical_orientations: Option<Vec<Option<UnitQuaternion<f64>>>>,
@@ -1627,6 +1694,10 @@ pub struct ArticulatedWorldSnapshot {
 /// Fixed-base reference world for revolute/fixed links and sphere-ground contact.
 #[derive(Debug)]
 pub struct ArticulatedWorld {
+    // Reserve root slots even while fixed: the public floating mode can change.
+    prescribed_coordinates: Vec<bool>,
+    constraint_policy: ArticulatedConstraintPolicy,
+    limit_compliance: Vec<ConstraintCompliance>,
     spherical_orientations: Option<Vec<Option<UnitQuaternion<f64>>>>,
     /// Articulated model.
     pub articulation: Articulation,
@@ -1659,6 +1730,7 @@ pub struct ArticulatedWorld {
     pub capsules: Vec<LinkCapsule>,
     /// Convex collision shapes for generic GPU narrow phases.
     pub convex_shapes: Vec<LinkConvex>,
+    triangle_meshes: Vec<LinkTriangleMesh>,
     /// Independent static and dynamic scene bodies.
     pub scene_bodies: Vec<SceneBody>,
     /// Contact force per link from the last integration substep, world frame.
@@ -1700,6 +1772,10 @@ pub struct ArticulatedWorld {
 #[cfg(feature = "gpu-contact")]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResidentSceneConfiguration {
+    joint_contacts_enabled: bool,
+    prescribed_coordinates: Vec<bool>,
+    constraint_policy: ArticulatedConstraintPolicy,
+    limit_compliance: Vec<ConstraintCompliance>,
     spheres: Vec<LinkSphere>,
     ground_points: Vec<LinkGroundPoint>,
     boxes: Vec<LinkBox>,
@@ -1707,6 +1783,7 @@ pub(crate) struct ResidentSceneConfiguration {
     cones: Vec<LinkCone>,
     capsules: Vec<LinkCapsule>,
     convex_shapes: Vec<LinkConvex>,
+    triangle_meshes: Vec<LinkTriangleMesh>,
     bodies: Vec<SceneBody>,
     materials: Vec<Vec<ColliderMaterial>>,
     ground_material: ColliderMaterial,
@@ -1754,6 +1831,7 @@ impl ResidentSceneConfiguration {
             && self.cones == world.cones
             && self.capsules == world.capsules
             && self.convex_shapes == world.convex_shapes
+            && self.triangle_meshes == world.triangle_meshes
             && self.bodies.len() == world.scene_bodies.len()
             && self
                 .bodies
@@ -1785,6 +1863,10 @@ impl ResidentSceneConfiguration {
             && self.params == world.params
             && self.self_contacts_enabled == world.self_contacts_enabled
             && self.implicit_coriolis == world.implicit_coriolis
+            && self.joint_contacts_enabled == world.joint_contacts_enabled()
+            && self.prescribed_coordinates == world.prescribed_coordinates
+            && self.constraint_policy == world.constraint_policy
+            && self.limit_compliance == world.limit_compliance
     }
 }
 
@@ -1803,6 +1885,10 @@ impl ArticulatedWorld {
             body.torque = Vector3::zeros();
         }
         ResidentSceneConfiguration {
+            joint_contacts_enabled: self.joint_contacts_enabled(),
+            prescribed_coordinates: self.prescribed_coordinates.clone(),
+            constraint_policy: self.constraint_policy,
+            limit_compliance: self.limit_compliance.clone(),
             spheres: self.colliders.clone(),
             ground_points: self.ground_points.clone(),
             boxes: self.boxes.clone(),
@@ -1810,6 +1896,7 @@ impl ArticulatedWorld {
             cones: self.cones.clone(),
             capsules: self.capsules.clone(),
             convex_shapes: self.convex_shapes.clone(),
+            triangle_meshes: self.triangle_meshes.clone(),
             bodies,
             materials: vec![
                 self.sphere_materials.clone(),
@@ -2487,6 +2574,7 @@ impl ArticulatedWorld {
         staging.cylinders = self.cylinders.clone();
         staging.cones = self.cones.clone();
         staging.convex_shapes = self.convex_shapes.clone();
+        staging.triangle_meshes = self.triangle_meshes.clone();
         staging.sphere_materials = (0..self.colliders.len())
             .map(|i| self.sphere_material(i))
             .collect();
@@ -3217,6 +3305,9 @@ impl ArticulatedWorld {
         let default_material = ColliderMaterial::new(params.friction, params.restitution);
         Ok(Self {
             articulation,
+            prescribed_coordinates: vec![false; dof + 6],
+            constraint_policy: ArticulatedConstraintPolicy::default(),
+            limit_compliance: vec![ConstraintCompliance::default(); dof],
             spherical_orientations: None,
             positions: DVector::zeros(dof),
             velocities: DVector::zeros(dof),
@@ -3233,6 +3324,7 @@ impl ArticulatedWorld {
             cones: Vec::new(),
             capsules: Vec::new(),
             convex_shapes: Vec::new(),
+            triangle_meshes: Vec::new(),
             scene_bodies: Vec::new(),
             contact_forces: vec![Vector3::zeros(); link_count],
             contact_torques: vec![Vector3::zeros(); link_count],
@@ -3436,6 +3528,72 @@ impl ArticulatedWorld {
         self.convex_materials = vec![default_material; self.convex_shapes.len()];
         self.clear_contact_cache();
         Ok(())
+    }
+
+    /// Indexed link surfaces in stable mesh order.
+    pub fn triangle_meshes(&self) -> &[LinkTriangleMesh] {
+        &self.triangle_meshes
+    }
+
+    /// Replace indexed link surfaces. Contact preserves each triangle rather
+    /// than filling the mesh's concavities. Materials use the world defaults.
+    pub fn set_triangle_meshes(
+        &mut self,
+        meshes: Vec<LinkTriangleMesh>,
+    ) -> Result<(), ArticulatedWorldError> {
+        if meshes.iter().any(|mesh| {
+            mesh.link >= self.articulation.link_count()
+                || mesh
+                    .origin
+                    .translation
+                    .vector
+                    .iter()
+                    .any(|value| !value.is_finite())
+                || mesh
+                    .origin
+                    .rotation
+                    .coords
+                    .iter()
+                    .any(|value| !value.is_finite())
+                || (mesh.origin.rotation.quaternion().norm_squared() - 1.0).abs() > 1e-8
+        }) {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
+        self.triangle_meshes = meshes;
+        self.clear_contact_cache();
+        Ok(())
+    }
+
+    fn contact_convex_shapes(&self) -> impl Iterator<Item = LinkConvexRef<'_>> {
+        self.convex_shapes
+            .iter()
+            .map(|shape| LinkConvexRef {
+                link: shape.link,
+                origin: shape.origin,
+                geometry: &shape.geometry,
+            })
+            .chain(self.triangle_meshes.iter().flat_map(|mesh| {
+                mesh.geometry.prisms().iter().map(|geometry| LinkConvexRef {
+                    link: mesh.link,
+                    origin: mesh.origin,
+                    geometry,
+                })
+            }))
+    }
+
+    fn contact_convex_count(&self) -> usize {
+        self.convex_shapes.len()
+            + self
+                .triangle_meshes
+                .iter()
+                .map(|mesh| mesh.geometry.triangles().len())
+                .sum::<usize>()
+    }
+
+    fn contact_convex_shape(&self, index: usize) -> LinkConvexRef<'_> {
+        self.contact_convex_shapes()
+            .nth(index)
+            .unwrap_or_else(|| unreachable!("contact primitive index was enumerated above"))
     }
 
     /// Add an independent scene body and return its stable slot until removal.
@@ -3926,6 +4084,18 @@ impl ArticulatedWorld {
         self.self_contacts_enabled
     }
 
+    /// Whether direct joint neighbors may contact, subject to explicit exclusions.
+    pub fn joint_contacts_enabled(&self) -> bool {
+        self.articulation.joint_contacts_enabled()
+    }
+
+    /// Enable joint-neighbor contacts without overriding explicit excluded pairs.
+    /// Resident pair topology must be rebuilt after this configuration changes.
+    pub fn set_joint_contacts_enabled(&mut self, enabled: bool) {
+        self.articulation.set_joint_contacts_enabled(enabled);
+        self.clear_contact_cache();
+    }
+
     /// Enable midpoint iterations for Coriolis and centrifugal velocity bias.
     pub fn set_implicit_coriolis(&mut self, enabled: bool) {
         self.implicit_coriolis = enabled;
@@ -3936,9 +4106,80 @@ impl ArticulatedWorld {
         self.implicit_coriolis
     }
 
+    /// Prescribed generalized coordinates, with an optional six-slot floating-root prefix.
+    pub fn prescribed_coordinates(&self) -> &[bool] {
+        let offset = if self.floating { 0 } else { 6 };
+        &self.prescribed_coordinates[offset..]
+    }
+
+    /// Select constant-velocity coordinates without changing their current velocities.
+    ///
+    /// Scalar, tangent spherical, and floating-root slots use the same selection.
+    /// Selected slots retain their velocity under forces, contact, and joint clamps.
+    pub fn set_prescribed_coordinates(
+        &mut self,
+        selected: &[bool],
+    ) -> Result<(), ArticulatedWorldError> {
+        if selected.len() != self.articulation.dof() + if self.floating { 6 } else { 0 } {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
+        let offset = if self.floating { 0 } else { 6 };
+        self.prescribed_coordinates[offset..].copy_from_slice(selected);
+        self.clear_contact_cache();
+        Ok(())
+    }
+
+    /// Current independent contact and loop compliance.
+    pub fn constraint_policy(&self) -> ArticulatedConstraintPolicy {
+        self.constraint_policy
+    }
+
+    /// Replace all contact and loop row policies after validating every value.
+    pub fn set_constraint_policy(
+        &mut self,
+        policy: ArticulatedConstraintPolicy,
+    ) -> Result<(), ArticulatedWorldError> {
+        if !policy.is_valid() {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
+        self.constraint_policy = policy;
+        self.clear_contact_cache();
+        Ok(())
+    }
+
+    /// Compliance of scalar joint stops in joint-slot order, without root slots.
+    pub fn joint_limit_compliance(&self) -> &[ConstraintCompliance] {
+        &self.limit_compliance
+    }
+
+    /// Replace stop compliance; unbounded coordinates must retain zero CFM.
+    pub fn set_joint_limit_compliance(
+        &mut self,
+        values: &[ConstraintCompliance],
+    ) -> Result<(), ArticulatedWorldError> {
+        if values.len() != self.articulation.dof()
+            || values.iter().enumerate().any(|(slot, value)| {
+                !value.is_valid()
+                    || (value.cfm > 0.0 && self.articulation.joint_limit(slot).is_none())
+            })
+        {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
+        self.limit_compliance = values.to_vec();
+        self.clear_contact_cache();
+        Ok(())
+    }
+
     /// Capture all mutable simulation state needed for an exact environment reset.
     pub fn snapshot(&self) -> ArticulatedWorldSnapshot {
         ArticulatedWorldSnapshot {
+            articulation: self.articulation.clone(),
+            params: self.params,
+            floating: self.floating,
+            joint_contacts_enabled: self.joint_contacts_enabled(),
+            prescribed_coordinates: self.prescribed_coordinates.clone(),
+            constraint_policy: self.constraint_policy,
+            limit_compliance: self.limit_compliance.clone(),
             positions: self.positions.clone(),
             velocities: self.velocities.clone(),
             spherical_orientations: self.spherical_orientations.clone(),
@@ -3973,19 +4214,45 @@ impl ArticulatedWorld {
         }
     }
 
-    /// Restore a snapshot created from a world with the same articulated model.
-    pub fn restore_snapshot(
-        &mut self,
+    /// Validate a snapshot without changing the world.
+    pub fn validate_snapshot(
+        &self,
         snapshot: &ArticulatedWorldSnapshot,
     ) -> Result<(), ArticulatedWorldError> {
+        if snapshot.floating != self.floating
+            || snapshot.articulation.dof() != self.articulation.dof()
+            || snapshot.articulation.link_count() != self.articulation.link_count()
+            || snapshot.articulation.joint_specs().len() != self.articulation.joint_specs().len()
+            || snapshot
+                .articulation
+                .joint_specs()
+                .iter()
+                .zip(self.articulation.joint_specs())
+                .enumerate()
+                .any(|(edge, (source, destination))| {
+                    (source.parent, source.child, source.kind)
+                        != (destination.parent, destination.child, destination.kind)
+                        || snapshot.articulation.joint_coordinate_range(edge)
+                            != self.articulation.joint_coordinate_range(edge)
+                })
+        {
+            return Err(ArticulatedWorldError::InvalidInput);
+        }
         if let Some(orientations) = &snapshot.spherical_orientations {
-            let _ = self.articulation.pose_with_spherical_orientations(
+            let _ = snapshot.articulation.pose_with_spherical_orientations(
                 snapshot.root_pose,
                 snapshot.positions.as_slice(),
                 orientations,
             )?;
         }
-        if snapshot.positions.len() != self.articulation.dof()
+        if snapshot.prescribed_coordinates.len() != self.articulation.dof() + 6
+            || snapshot.limit_compliance.len() != self.articulation.dof()
+            || !snapshot.constraint_policy.is_valid()
+            || snapshot
+                .limit_compliance
+                .iter()
+                .any(|value| !value.is_valid())
+            || snapshot.positions.len() != self.articulation.dof()
             || snapshot.scene_bodies.iter().any(|body| {
                 body.kinematic
                     && (body.mass != 0.0
@@ -4052,7 +4319,8 @@ impl ArticulatedWorld {
                     motor.is_some_and(|drive| {
                         !drive.is_valid()
                             || drive.position_target.is_some_and(|target| {
-                                self.articulation
+                                snapshot
+                                    .articulation
                                     .joint_limit(slot)
                                     .is_some_and(|(lower, upper)| target < lower || target > upper)
                             })
@@ -4061,8 +4329,25 @@ impl ArticulatedWorld {
         {
             return Err(ArticulatedWorldError::InvalidInput);
         }
+        Ok(())
+    }
+
+    /// Restore a snapshot created from a world with the same articulated model.
+    pub fn restore_snapshot(
+        &mut self,
+        snapshot: &ArticulatedWorldSnapshot,
+    ) -> Result<(), ArticulatedWorldError> {
+        self.validate_snapshot(snapshot)?;
+        self.articulation.clone_from(&snapshot.articulation);
+        self.params = snapshot.params;
         self.spherical_orientations
             .clone_from(&snapshot.spherical_orientations);
+        self.prescribed_coordinates
+            .clone_from(&snapshot.prescribed_coordinates);
+        self.constraint_policy = snapshot.constraint_policy;
+        self.articulation
+            .set_joint_contacts_enabled(snapshot.joint_contacts_enabled);
+        self.limit_compliance.clone_from(&snapshot.limit_compliance);
         self.positions.clone_from(&snapshot.positions);
         self.velocities.clone_from(&snapshot.velocities);
         self.root_pose = snapshot.root_pose;
@@ -4151,7 +4436,11 @@ impl ArticulatedWorld {
     }
 
     fn convex_material(&self, index: usize) -> ColliderMaterial {
-        assigned_material(&self.convex_materials, index, self.default_material())
+        if index < self.convex_shapes.len() {
+            assigned_material(&self.convex_materials, index, self.default_material())
+        } else {
+            self.default_material()
+        }
     }
 
     fn hull_material(&self, index: usize) -> ColliderMaterial {
@@ -4386,7 +4675,7 @@ impl ArticulatedWorld {
             || !self.boxes.is_empty()
             || !self.cylinders.is_empty()
             || !self.cones.is_empty()
-            || !self.convex_shapes.is_empty();
+            || self.contact_convex_count() != 0;
         let has_solver_rows = has_ground_contacts
             || self.joint_friction.iter().any(|&value| value > 0.0)
             || !self.joint_couplings.is_empty()
@@ -4405,8 +4694,7 @@ impl ArticulatedWorld {
                 + self.ground_points.len()
                 + 2 * self.capsules.len()
                 + self
-                    .convex_shapes
-                    .iter()
+                    .contact_convex_shapes()
                     .map(|shape| shape.geometry.vertices.len())
                     .sum::<usize>(),
         );
@@ -4483,7 +4771,7 @@ impl ArticulatedWorld {
                 });
             }
         }
-        for (index, shape) in self.convex_shapes.iter().enumerate() {
+        for (index, shape) in self.contact_convex_shapes().enumerate() {
             let material = self.ground_material.combine(self.convex_material(index));
             if material.restitution > 1.0 {
                 return Err(ArticulatedWorldError::GpuResidentUnsupported(
@@ -5057,7 +5345,7 @@ impl ArticulatedWorld {
             }
         }
         for axial in &axial_shapes {
-            for (convex_index, convex) in self.convex_shapes.iter().enumerate() {
+            for (convex_index, convex) in self.contact_convex_shapes().enumerate() {
                 if !self.link_pair_can_contact(axial.0, convex.link) {
                     continue;
                 }
@@ -5082,7 +5370,7 @@ impl ArticulatedWorld {
                 });
             }
         }
-        for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+        for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
             for (sphere_index, sphere) in self.colliders.iter().enumerate() {
                 if !self.link_pair_can_contact(shape.link, sphere.link) {
                     continue;
@@ -5165,7 +5453,10 @@ impl ArticulatedWorld {
                     friction: material.friction,
                 });
             }
-            for (other_index, other) in self.convex_shapes.iter().enumerate().skip(shape_index + 1)
+            for (other_index, other) in self
+                .contact_convex_shapes()
+                .enumerate()
+                .skip(shape_index + 1)
             {
                 if !self.link_pair_can_contact(shape.link, other.link) {
                     continue;
@@ -5205,9 +5496,9 @@ impl ArticulatedWorld {
                                 linear_velocity: body.linear_velocity,
                                 angular_velocity: body.angular_velocity,
                             });
-                    if !self.convex_shapes.is_empty() {
+                    if self.contact_convex_count() != 0 {
                         let box_geometry = gpu_box_convex_geometry(*half_extents)?;
-                        for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+                        for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
                             let material = self
                                 .convex_material(shape_index)
                                 .combine(self.scene_material(body_index, collider_index));
@@ -5483,7 +5774,7 @@ impl ArticulatedWorld {
                             friction: material.friction,
                         });
                     }
-                    for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+                    for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
                         let material = self
                             .convex_material(shape_index)
                             .combine(self.scene_material(body_index, collider_index));
@@ -5628,7 +5919,7 @@ impl ArticulatedWorld {
                                 );
                             }
                         }
-                        for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+                        for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
                             let material = self
                                 .convex_material(shape_index)
                                 .combine(self.scene_material(body_index, collider_index));
@@ -5813,7 +6104,7 @@ impl ArticulatedWorld {
                             friction: material.friction,
                         });
                     }
-                    for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+                    for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
                         let material = self
                             .convex_material(shape_index)
                             .combine(self.scene_material(body_index, collider_index));
@@ -5994,7 +6285,7 @@ impl ArticulatedWorld {
                                 );
                             }
                         }
-                        for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+                        for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
                             let material = self
                                 .convex_material(shape_index)
                                 .combine(self.scene_material(body_index, collider_index));
@@ -6142,7 +6433,7 @@ impl ArticulatedWorld {
                             friction: material.friction,
                         });
                     }
-                    for (convex_index, convex) in self.convex_shapes.iter().enumerate() {
+                    for (convex_index, convex) in self.contact_convex_shapes().enumerate() {
                         let material = self
                             .convex_material(convex_index)
                             .combine(self.scene_material(body_index, collider_index));
@@ -6288,7 +6579,7 @@ impl ArticulatedWorld {
                     });
                     external_sphere_bodies.axial.push(external_body);
                 }
-                for (shape_index, shape) in self.convex_shapes.iter().enumerate() {
+                for (shape_index, shape) in self.contact_convex_shapes().enumerate() {
                     let material = self
                         .convex_material(shape_index)
                         .combine(self.scene_material(body_index, collider_index));
@@ -6639,7 +6930,8 @@ impl ArticulatedWorld {
 
     /// Set explicit spherical poses and joint-frame angular velocities for resident dynamics.
     /// The velocity vector contains joint slots only; spherical item indices include the
-    /// optional floating-root prefix. Legacy CPU stepping is unavailable in this mode.
+    /// optional floating-root prefix. CPU and resident stepping use quaternion
+    /// exponential integration and joint-frame angular velocity in this mode.
     #[cfg(feature = "gpu-contact")]
     pub fn set_tangent_spherical_state(
         &mut self,
@@ -6969,9 +7261,6 @@ impl ArticulatedWorld {
         #[cfg(feature = "gpu-contact")] gpu: Option<&GpuContactDevice>,
         #[cfg(not(feature = "gpu-contact"))] _gpu: Option<&()>,
     ) -> Result<(), ArticulatedWorldError> {
-        if self.spherical_orientations.is_some() {
-            return Err(ArticulatedWorldError::InvalidInput);
-        }
         let count = self.validated_substeps(dt, torques)?;
         for _ in 0..count {
             self.step_once(
@@ -7057,6 +7346,32 @@ impl ArticulatedWorld {
         velocity
     }
 
+    fn current_dynamics(
+        &self,
+        velocity: &DVector<f64>,
+        gravity: Vector3<f64>,
+    ) -> Result<crate::articulation::GeneralizedDynamics, ArticulatedWorldError> {
+        Ok(match &self.spherical_orientations {
+            Some(orientations) => self
+                .articulation
+                .generalized_dynamics_with_spherical_orientations(
+                    self.root_pose,
+                    self.positions.as_slice(),
+                    orientations,
+                    velocity,
+                    self.floating,
+                    gravity,
+                )?,
+            None => self.articulation.generalized_dynamics(
+                self.root_pose,
+                self.positions.as_slice(),
+                velocity,
+                self.floating,
+                gravity,
+            )?,
+        })
+    }
+
     fn applied_generalized_force(
         &self,
         pose: &ArticulationPose,
@@ -7065,6 +7380,29 @@ impl ArticulatedWorld {
         torques: &[f64],
     ) -> Result<DVector<f64>, ArticulatedWorldError> {
         let offset = if self.floating { 6 } else { 0 };
+        // Normalize acceleration gains against the native articulated response,
+        // before passive implicit tangents modify the integration matrix.
+        let motor_inverse = if self
+            .joint_motors
+            .iter()
+            .flatten()
+            .any(|motor| motor.model == MotorModel::AccelerationBased)
+        {
+            let mass = self
+                .current_dynamics(&self.current_generalized_velocity(), Vector3::zeros())?
+                .mass;
+            Some(
+                solve_prescribed_mass(
+                    &mass,
+                    &DVector::zeros(mass.nrows()),
+                    self.prescribed_coordinates(),
+                )
+                .map_err(|_| ArticulatedWorldError::SingularMass)?
+                .1,
+            )
+        } else {
+            None
+        };
         for (link_index, load) in self.link_loads.iter().enumerate() {
             if load.force == Vector3::zeros()
                 && load.torque == Vector3::zeros()
@@ -7091,9 +7429,18 @@ impl ArticulatedWorld {
             }
         }
         for (slot, torque) in torques.iter().enumerate() {
+            if self.prescribed_coordinates()[offset + slot] {
+                continue;
+            }
             let motor_force = self.joint_motors[slot]
                 .map_or(Some(0.0), |motor| {
-                    motor.force(self.positions[slot], self.velocities[slot])
+                    motor.force(
+                        self.positions[slot],
+                        self.velocities[slot],
+                        motor_inverse
+                            .as_ref()
+                            .map_or(0.0, |inverse| inverse[(offset + slot, offset + slot)]),
+                    )
                 })
                 .ok_or(ArticulatedWorldError::NumericalInstability)?;
             applied_force[offset + slot] += torque + motor_force;
@@ -7359,20 +7706,14 @@ impl ArticulatedWorld {
             }
         }
         let pose = self.current_pose()?;
-        let floating_com = self
-            .floating
-            .then(|| self.articulation.center_of_mass(&pose))
-            .transpose()?;
+        let floating_com = (self.floating
+            && !self.prescribed_coordinates().iter().any(|&value| value))
+        .then(|| self.articulation.center_of_mass(&pose))
+        .transpose()?;
         let gravity = Vector3::from(self.params.gravity);
         let offset = if self.floating { 6 } else { 0 };
         let velocity = self.current_generalized_velocity();
-        let dynamics = self.articulation.generalized_dynamics(
-            self.root_pose,
-            self.positions.as_slice(),
-            &velocity,
-            self.floating,
-            gravity,
-        )?;
+        let dynamics = self.current_dynamics(&velocity, gravity)?;
         let old_base_momentum = self.floating.then(|| dynamics.mass.rows(0, 6) * &velocity);
         let mut applied_force =
             self.applied_generalized_force(&pose, gravity, dynamics.gravity_force, torques)?;
@@ -7397,7 +7738,15 @@ impl ArticulatedWorld {
         {
             return Err(ArticulatedWorldError::NumericalInstability);
         }
-        let inverse_mass = if let Some(inverse) = inverse_override {
+        let inverse_mass = if self.prescribed_coordinates().iter().any(|&value| value) {
+            solve_prescribed_mass(
+                &effective_mass,
+                &applied_force,
+                self.prescribed_coordinates(),
+            )
+            .map_err(|_| ArticulatedWorldError::SingularMass)?
+            .1
+        } else if let Some(inverse) = inverse_override {
             if inverse.shape() != effective_mass.shape()
                 || inverse.iter().any(|value| !value.is_finite())
             {
@@ -7426,14 +7775,7 @@ impl ArticulatedWorld {
             }
             let midpoint_velocity = (&velocity + &predicted_velocity) * 0.5;
             let midpoint_bias = self
-                .articulation
-                .generalized_dynamics(
-                    self.root_pose,
-                    self.positions.as_slice(),
-                    &midpoint_velocity,
-                    self.floating,
-                    gravity,
-                )?
+                .current_dynamics(&midpoint_velocity, gravity)?
                 .velocity_bias;
             predicted_velocity = &velocity + &inverse_mass * (&applied_force - midpoint_bias) * dt;
         }
@@ -7504,8 +7846,7 @@ impl ArticulatedWorld {
             self.ground_points.len()
                 + 8 * self.boxes.len()
                 + self
-                    .convex_shapes
-                    .iter()
+                    .contact_convex_shapes()
                     .map(|shape| shape.geometry.vertices.len())
                     .sum::<usize>()
                 + 4 * world_analytic.len()
@@ -7539,7 +7880,7 @@ impl ArticulatedWorld {
                 }
             }
         }
-        for (index, shape) in self.convex_shapes.iter().enumerate() {
+        for (index, shape) in self.contact_convex_shapes().enumerate() {
             for vertex in &shape.geometry.vertices {
                 let local = shape.origin.transform_point(&Point3::from(*vertex));
                 point_links.push(shape.link);
@@ -8136,7 +8477,7 @@ impl ArticulatedWorld {
             }
         }
         let mut hulls: Vec<WorldHull> =
-            Vec::with_capacity(self.boxes.len() + self.convex_shapes.len());
+            Vec::with_capacity(self.boxes.len() + self.contact_convex_count());
         for (box_index, (shape, frame)) in self.boxes.iter().zip(&box_poses).enumerate() {
             let vertices = [-1.0, 1.0]
                 .into_iter()
@@ -8163,7 +8504,7 @@ impl ArticulatedWorld {
                 self.box_material(box_index),
             ));
         }
-        for (convex_index, shape) in self.convex_shapes.iter().enumerate() {
+        for (convex_index, shape) in self.contact_convex_shapes().enumerate() {
             let frame = pose.links[shape.link] * shape.origin;
             let vertices = shape
                 .geometry
@@ -8205,7 +8546,8 @@ impl ArticulatedWorld {
             .collect::<Vec<_>>();
         #[cfg(feature = "gpu-contact")]
         let robot_lbvh_pairs = if let Some(context) = gpu.filter(|_| {
-            !self.convex_shapes.is_empty() && hulls.len().saturating_add(self.colliders.len()) > 64
+            self.contact_convex_count() != 0
+                && hulls.len().saturating_add(self.colliders.len()) > 64
         }) {
             let pack_lower = |value: f64| {
                 let packed = value as f32;
@@ -8281,7 +8623,7 @@ impl ArticulatedWorld {
                 } else if a >= self.boxes.len() && a < hulls.len() && b >= hulls.len() {
                     let convex_index = a - self.boxes.len();
                     let sphere_index = b - hulls.len();
-                    let shape = &self.convex_shapes[convex_index];
+                    let shape = self.contact_convex_shape(convex_index);
                     let sphere = &self.colliders[sphere_index];
                     if !self.link_pair_can_contact(shape.link, sphere.link) {
                         return;
@@ -8500,7 +8842,7 @@ impl ArticulatedWorld {
             let pairs = sphere_convex_pairs
                 .iter()
                 .map(|&(convex_index, sphere_index)| {
-                    (convex_index, self.convex_shapes.len() + sphere_index)
+                    (convex_index, self.contact_convex_count() + sphere_index)
                 })
                 .collect::<Vec<_>>();
             Some(
@@ -8514,7 +8856,7 @@ impl ArticulatedWorld {
         for (pair_index, &(convex_index, sphere_index)) in sphere_convex_pairs.iter().enumerate() {
             #[cfg(not(feature = "gpu-contact"))]
             let _ = pair_index;
-            let shape = &self.convex_shapes[convex_index];
+            let shape = self.contact_convex_shape(convex_index);
             let sphere = &self.colliders[sphere_index];
             let (_, vertices, normals, _, _) = &hulls[self.boxes.len() + convex_index];
             #[cfg(feature = "gpu-contact")]
@@ -9878,8 +10220,39 @@ impl ArticulatedWorld {
             max_correction_speed: 2.0,
         };
         let mut warm_start = warm_start_impulses(&contact_frames, &self.contact_cache, dt);
+        let mut row_cfm = Vec::with_capacity(contacts.len());
+        for (contact, frame) in contacts.iter_mut().zip(&contact_frames) {
+            let responds =
+                |owner: ContactOwner| -> Result<bool, ArticulatedWorldError> {
+                    match owner {
+                        ContactOwner::Ground => Ok(false),
+                        ContactOwner::Scene(index) => Ok(self.scene_bodies[index].mass > 0.0
+                            && !self.scene_bodies[index].kinematic),
+                        ContactOwner::Robot(link) => {
+                            let local = pose.links[link]
+                                .inverse_transform_point(&Point3::from(frame.position))
+                                .coords;
+                            let (linear, _) = self.articulation.generalized_point_jacobians(
+                                &pose,
+                                link,
+                                local,
+                                self.floating,
+                            )?;
+                            let normal = linear.transpose() * frame.normal;
+                            Ok(normal.dot(&(&inverse_mass * &normal)) > 1e-12)
+                        }
+                    }
+                };
+            let compliance = if responds(frame.owners.0)? && responds(frame.owners.1)? {
+                self.constraint_policy.dynamic_contact
+            } else {
+                self.constraint_policy.fixed_contact
+            };
+            contact.penetration *= compliance.erp / solve_params.position_gain;
+            row_cfm.push(compliance.cfm);
+        }
         for (slot, &friction) in self.joint_friction.iter().enumerate() {
-            if friction > 0.0 {
+            if friction > 0.0 && !self.prescribed_coordinates()[offset + slot] {
                 let bound = friction * dt;
                 if !bound.is_finite() {
                     return Err(ArticulatedWorldError::InvalidInput);
@@ -9888,13 +10261,58 @@ impl ArticulatedWorld {
                 axis[offset + slot] = 1.0;
                 contacts.push(ContactConstraint::bounded_axis(axis, bound));
                 warm_start.push(ContactImpulse::default());
+                row_cfm.push(0.0);
             }
+        }
+        let mut normal_offsets = vec![0.0; contacts.len()];
+        for (slot, compliance) in self.limit_compliance.iter().enumerate() {
+            if compliance.cfm == 0.0 || self.prescribed_coordinates()[offset + slot] {
+                continue;
+            }
+            let (lower, upper) = self
+                .articulation
+                .joint_limit(slot)
+                .ok_or(ArticulatedWorldError::InvalidInput)?;
+            let q = self.positions[slot];
+            let predicted = q + dt * combined_velocity[offset + slot];
+            let direction = if q < lower || predicted < lower {
+                1.0
+            } else if q > upper || predicted > upper {
+                -1.0
+            } else {
+                continue;
+            };
+            let gap = if direction > 0.0 {
+                q - lower
+            } else {
+                upper - q
+            };
+            let target = if gap < 0.0 {
+                -compliance.erp * gap / dt
+            } else {
+                -gap / dt
+            };
+            let mut axis = DVector::zeros(total_dof);
+            axis[offset + slot] = direction;
+            // Shift only the row velocity to express speculative stops without
+            // changing the unilateral impulse projection.
+            contacts.push(ContactConstraint {
+                scalar: None,
+                normal: axis,
+                tangents: [DVector::zeros(total_dof), DVector::zeros(total_dof)],
+                penetration: 0.0,
+                friction: 0.0,
+                restitution: 0.0,
+            });
+            warm_start.push(ContactImpulse::default());
+            row_cfm.push(compliance.cfm);
+            normal_offsets.push(-target);
         }
         for coupling in &self.joint_couplings {
             let error = self.positions[coupling.follower]
                 - coupling.multiplier * self.positions[coupling.source]
                 - coupling.offset;
-            let target_speed = -solve_params.position_gain * error / dt;
+            let target_speed = -self.constraint_policy.coupling.erp * error / dt;
             if !target_speed.is_finite() {
                 return Err(ArticulatedWorldError::InvalidInput);
             }
@@ -9918,7 +10336,7 @@ impl ArticulatedWorld {
                 .value_and_derivative(source_position)
                 .ok_or(ArticulatedWorldError::InvalidInput)?;
             let error = self.positions[coupling.follower] - coupling.follower_reference - value;
-            let target_speed = -solve_params.position_gain * error / dt;
+            let target_speed = -self.constraint_policy.coupling.erp * error / dt;
             if !target_speed.is_finite() {
                 return Err(ArticulatedWorldError::InvalidInput);
             }
@@ -9936,6 +10354,7 @@ impl ArticulatedWorld {
             ));
             warm_start.push(ContactImpulse::default());
         }
+        row_cfm.resize(contacts.len(), self.constraint_policy.coupling.cfm);
         for constraint in &self.link_point_constraints {
             let point_a = pose.links[constraint.link_a]
                 .transform_point(&Point3::from(Vector3::from(constraint.point_a)))
@@ -9970,13 +10389,13 @@ impl ArticulatedWorld {
                 if !effective_inverse_mass.is_finite() {
                     return Err(ArticulatedWorldError::NumericalInstability);
                 }
-                if effective_inverse_mass <= 1e-12 {
+                if effective_inverse_mass <= 1e-12 && self.constraint_policy.point_loop.cfm == 0.0 {
                     if error[component].abs() > 1e-9 {
                         return Err(ContactSolveError::SingularContact.into());
                     }
                     continue;
                 }
-                let target_speed = -solve_params.position_gain * error[component] / dt;
+                let target_speed = -self.constraint_policy.point_loop.erp * error[component] / dt;
                 if !target_speed.is_finite() {
                     return Err(ArticulatedWorldError::InvalidInput);
                 }
@@ -9990,6 +10409,7 @@ impl ArticulatedWorld {
                 warm_start.push(ContactImpulse::default());
             }
         }
+        row_cfm.resize(contacts.len(), self.constraint_policy.point_loop.cfm);
         for constraint in &self.link_fixed_constraints {
             let frame_a = pose.links[constraint.link_a] * constraint.frame_a;
             let (linear_a, angular_a) = self.articulation.generalized_point_jacobians(
@@ -10022,13 +10442,16 @@ impl ArticulatedWorld {
                     if !effective_inverse_mass.is_finite() {
                         return Err(ArticulatedWorldError::NumericalInstability);
                     }
-                    if effective_inverse_mass <= 1e-12 {
+                    if effective_inverse_mass <= 1e-12
+                        && self.constraint_policy.fixed_loop.cfm == 0.0
+                    {
                         if error[component].abs() > 1e-9 {
                             return Err(ContactSolveError::SingularContact.into());
                         }
                         continue;
                     }
-                    let target_speed = -solve_params.position_gain * error[component] / dt;
+                    let target_speed =
+                        -self.constraint_policy.fixed_loop.erp * error[component] / dt;
                     if !target_speed.is_finite() {
                         return Err(ArticulatedWorldError::InvalidInput);
                     }
@@ -10043,6 +10466,7 @@ impl ArticulatedWorld {
                 }
             }
         }
+        row_cfm.resize(contacts.len(), self.constraint_policy.fixed_loop.cfm);
         for constraint in &self.link_scene_point_constraints {
             let point_a = pose.links[constraint.link]
                 .transform_point(&Point3::from(Vector3::from(constraint.link_point)))
@@ -10077,12 +10501,16 @@ impl ArticulatedWorld {
                     error[component],
                     &combined_inverse_mass,
                     dt,
-                    solve_params,
-                    &mut contacts,
-                    &mut warm_start,
+                    SolveParams {
+                        position_gain: self.constraint_policy.point_loop.erp,
+                        ..solve_params
+                    },
+                    self.constraint_policy.point_loop.cfm,
+                    (&mut contacts, &mut warm_start),
                 )?;
             }
         }
+        row_cfm.resize(contacts.len(), self.constraint_policy.point_loop.cfm);
         for constraint in &self.link_scene_fixed_constraints {
             let frame_a = pose.links[constraint.link] * constraint.link_frame;
             let body = &self.scene_bodies[constraint.body];
@@ -10124,18 +10552,24 @@ impl ArticulatedWorld {
                         error[component],
                         &combined_inverse_mass,
                         dt,
-                        solve_params,
-                        &mut contacts,
-                        &mut warm_start,
+                        SolveParams {
+                            position_gain: self.constraint_policy.fixed_loop.erp,
+                            ..solve_params
+                        },
+                        self.constraint_policy.fixed_loop.cfm,
+                        (&mut contacts, &mut warm_start),
                     )?;
                 }
             }
         }
-        let problem = ContactProblem {
+        row_cfm.resize(contacts.len(), self.constraint_policy.fixed_loop.cfm);
+        let mut problem = ContactProblem {
             inverse_mass: combined_inverse_mass,
             velocity: combined_velocity,
             contacts,
         };
+        normal_offsets.resize(problem.contacts.len(), 0.0);
+        add_compliant_rows(&mut problem, &row_cfm, &normal_offsets, dt)?;
         Ok(PendingContactStep {
             problem,
             warm_start,
@@ -10210,6 +10644,12 @@ impl ArticulatedWorld {
         let mut joint_constrained = false;
         for slot in 0..self.articulation.dof() {
             let velocity_slot = offset + slot;
+            if self.prescribed_coordinates()[velocity_slot] {
+                constrained_velocity[velocity_slot] = predicted_velocity[velocity_slot];
+                next_positions[slot] =
+                    self.positions[slot] + constrained_velocity[velocity_slot] * dt;
+                continue;
+            }
             if let Some(limit) = self.joint_velocity_limit {
                 let limited = constrained_velocity[velocity_slot].clamp(-limit, limit);
                 joint_constrained |= limited != constrained_velocity[velocity_slot];
@@ -10217,6 +10657,7 @@ impl ArticulatedWorld {
             }
             let candidate = self.positions[slot] + constrained_velocity[velocity_slot] * dt;
             next_positions[slot] = if let Some((lower, upper)) = self.articulation.joint_limit(slot)
+                && self.limit_compliance[slot].cfm == 0.0
             {
                 let limited = candidate.clamp(lower, upper);
                 if limited != candidate {
@@ -10235,9 +10676,9 @@ impl ArticulatedWorld {
             let coupling = mass.slice((0, 6), (6, joint_count));
             let reaction = coupling * joint_delta;
             let root_mass = mass.slice((0, 0), (6, 6)).into_owned();
-            let Some(root_delta) = root_mass.lu().solve(&reaction) else {
-                return Err(ArticulatedWorldError::SingularMass);
-            };
+            let (root_delta, _) =
+                solve_prescribed_mass(&root_mass, &reaction, &self.prescribed_coordinates()[..6])
+                    .map_err(|_| ArticulatedWorldError::SingularMass)?;
             for axis in 0..6 {
                 constrained_velocity[axis] += root_delta[axis];
             }
@@ -10351,6 +10792,15 @@ impl ArticulatedWorld {
         }
         let mut active = vec![false; robot_node + 1];
         let mut pending_activity = Vec::new();
+        if self
+            .prescribed_coordinates
+            .iter()
+            .zip(predicted_velocity.iter())
+            .any(|(&selected, &speed)| selected && speed != 0.0)
+        {
+            active[robot_node] = true;
+            pending_activity.push(robot_node);
+        }
         for (index, body) in self.scene_bodies.iter().enumerate() {
             if body.kinematic
                 && (body.linear_velocity.norm_squared() > 1e-12
@@ -10421,12 +10871,36 @@ impl ArticulatedWorld {
                     * body.pose.rotation;
             }
         }
+        if let Some(orientations) = &mut self.spherical_orientations {
+            for (edge, orientation) in orientations.iter_mut().enumerate() {
+                if let Some(value) = orientation {
+                    let range = self
+                        .articulation
+                        .joint_coordinate_range(edge)
+                        .ok_or(ArticulatedWorldError::InvalidInput)?;
+                    let angular = Vector3::new(
+                        self.velocities[range.start],
+                        self.velocities[range.start + 1],
+                        self.velocities[range.start + 2],
+                    );
+                    *value = UnitQuaternion::from_scaled_axis(angular * dt) * *value;
+                    for slot in range {
+                        next_positions[slot] = self.positions[slot];
+                    }
+                }
+            }
+        }
         self.positions = next_positions;
         if self.floating {
             self.root_pose.translation.vector += self.base_linear_velocity * dt;
             self.root_pose.rotation =
                 UnitQuaternion::from_scaled_axis(self.base_angular_velocity * dt)
                     * self.root_pose.rotation;
+            // A prescribed coordinate exchanges momentum with its external driver.
+            // Free-body COM/momentum projection would overwrite that motion.
+            if self.prescribed_coordinates().iter().any(|&value| value) {
+                return Ok(());
+            }
             let Some((mass, previous_com)) = floating_com else {
                 return Err(ArticulatedWorldError::InvalidInput);
             };
@@ -13062,6 +13536,7 @@ mod tests {
             ..Default::default()
         };
         let motor = JointMotor {
+            model: MotorModel::ForceBased,
             position_target: Some(0.2),
             velocity_target: 0.3,
             stiffness: 4.0,
@@ -13431,6 +13906,7 @@ mod tests {
                 .set_joint_motor(
                     0,
                     Some(JointMotor {
+                        model: MotorModel::ForceBased,
                         position_target: Some(0.5),
                         velocity_target: 0.0,
                         stiffness: 2.0,
@@ -23940,6 +24416,7 @@ mod tests {
         driven.params.gravity = [0.0; 3];
         reference.params.gravity = [0.0; 3];
         let motor = JointMotor {
+            model: MotorModel::ForceBased,
             position_target: Some(1.0),
             velocity_target: 0.0,
             stiffness: 100.0,
@@ -23984,6 +24461,7 @@ mod tests {
             .set_joint_motor(
                 0,
                 Some(JointMotor {
+                    model: MotorModel::ForceBased,
                     position_target: None,
                     velocity_target: 1.0,
                     stiffness: 0.0,
@@ -24082,6 +24560,7 @@ mod tests {
         )
         .unwrap();
         let motor = JointMotor {
+            model: MotorModel::ForceBased,
             position_target: Some(0.2),
             velocity_target: 0.0,
             stiffness: 3.0,

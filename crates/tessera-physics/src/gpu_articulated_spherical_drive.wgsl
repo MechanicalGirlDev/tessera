@@ -12,6 +12,8 @@ struct Drive {
 @group(0) @binding(3) var<storage, read_write> status: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read> mass_status: array<u32>;
 @group(0) @binding(5) var<storage, read_write> forces: array<f32>;
+@group(0) @binding(6) var<storage, read> inverse_mass: array<f32>;
+@group(0) @binding(7) var<storage, read> inverse_indices: array<vec2<u32>>;
 
 fn product(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w*b.w-dot(a.xyz,b.xyz));
@@ -55,9 +57,22 @@ fn assemble_spherical_drives(@builtin(global_invocation_id) invocation: vec3<u32
     }
     let offset = drive.indices.x;
     let omega = vec3<f32>(velocities[offset], velocities[offset+1u], velocities[offset+2u]);
-    let torque = drive.stiffness.xyz * logarithm + drive.damping.xyz * (drive.velocity.xyz-omega);
+    var torque = drive.stiffness.xyz * logarithm + drive.damping.xyz * (drive.velocity.xyz-omega);
+    if (drive.indices.w == 2u) {
+        let indices = inverse_indices[index];
+        let response = vec3<f32>(inverse_mass[indices.x],
+            inverse_mass[indices.x + indices.y], inverse_mass[indices.x + 2u * indices.y]);
+        if (!all(response >= vec3<f32>(0.0)) || !all(response < vec3<f32>(3.402823e38))) {
+            atomicOr(&status[environment], 1u);
+            return;
+        }
+        let movable = response > vec3<f32>(0.0);
+        let denominator = select(vec3<f32>(1.0), response, movable);
+        torque = select(vec3<f32>(0.0), torque / denominator, movable);
+    }
     if (!all(abs(torque) < vec3<f32>(1e30))) { atomicOr(&status[environment], 1u); return; }
-    let capped = clamp(torque, -drive.cap.xyz, drive.cap.xyz);
+    let finite_cap = max(drive.cap.xyz, vec3<f32>(0.0));
+    let capped = select(torque, clamp(torque, -finite_cap, finite_cap), drive.cap.xyz >= vec3<f32>(0.0));
     let output = vec3<f32>(forces[offset],forces[offset+1u],forces[offset+2u]) + capped;
     if (!all(abs(output) < vec3<f32>(1e30))) { atomicOr(&status[environment], 1u); return; }
     forces[offset] = output.x;

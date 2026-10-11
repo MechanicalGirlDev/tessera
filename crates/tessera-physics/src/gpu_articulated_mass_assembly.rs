@@ -58,6 +58,7 @@ pub struct GpuArticulatedMassAssemblyBatch {
     metadata: wgpu::Buffer,
     links: wgpu::Buffer,
     vectors: wgpu::Buffer,
+    prescribed: wgpu::Buffer,
     inverse_state: OnceLock<GpuInverseState>,
     expansion_pipeline: OnceLock<wgpu::ComputePipeline>,
     inverse_bytes: u64,
@@ -182,7 +183,7 @@ impl GpuArticulatedMassAssemblyBatch {
             }
         }
         if systems.len() > limits.max_compute_workgroups_per_dimension as usize
-            || limits.max_storage_buffers_per_shader_stage < 4
+            || limits.max_storage_buffers_per_shader_stage < 5
         {
             return Err(GpuArticulatedMassError::Capacity);
         }
@@ -206,6 +207,13 @@ impl GpuArticulatedMassAssemblyBatch {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
+        let prescribed = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tessera prescribed generalized coordinates"),
+            contents: bytemuck::cast_slice(&vec![0u32; dimensions.iter().sum()]),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Tessera articulated mass assembly"),
             source: wgpu::ShaderSource::Wgsl(
@@ -227,6 +235,7 @@ impl GpuArticulatedMassAssemblyBatch {
             metadata,
             links,
             vectors,
+            prescribed,
             inverse_state: OnceLock::new(),
             expansion_pipeline: OnceLock::new(),
             inverse_bytes,
@@ -403,6 +412,55 @@ impl GpuArticulatedMassAssemblyBatch {
         &self.vectors
     }
 
+    pub(crate) fn prescribed_buffer(&self) -> &wgpu::Buffer {
+        &self.prescribed
+    }
+
+    /// Select coordinates whose existing generalized velocities are prescribed.
+    ///
+    /// The acceleration solve uses the dynamic principal mass block, and contact
+    /// receives its inverse embedded with exactly zero prescribed rows/columns.
+    /// This is not a mask applied after an unrestricted solve. Full link
+    /// Jacobians and velocities remain available to velocity bias and kinematics.
+    ///
+    /// Masks use the mass layout: scalar slots, spherical angular tangent slots,
+    /// and six leading world-twist slots for floating roots when present. Each
+    /// environment must supply exactly its generalized dimension. Prescribed
+    /// acceleration is zero; changing prescribed velocity between steps is a
+    /// state update, not an acceleration command.
+    ///
+    /// Limits, velocity clamps, and sleep freezing must exclude these slots in
+    /// the owner. The selection survives mass updates. Already encoded commands
+    /// retain the previous selection, so changes require re-encoding the step.
+    pub fn set_prescribed_coordinates(
+        &mut self,
+        masks: &[Vec<bool>],
+    ) -> Result<(), GpuArticulatedMassError> {
+        if masks.len() != self.dimensions.len()
+            || masks
+                .iter()
+                .zip(&self.dimensions)
+                .any(|(mask, &dimension)| mask.len() != dimension)
+        {
+            return Err(GpuArticulatedMassError::InvalidInput);
+        }
+        let packed = masks
+            .iter()
+            .flatten()
+            .map(|&selected| u32::from(selected))
+            .collect::<Vec<_>>();
+        self.prescribed = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tessera prescribed generalized coordinates"),
+                contents: bytemuck::cast_slice(&packed),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            });
+        Ok(())
+    }
+
     /// Replace link terms and forces without reallocating GPU buffers.
     pub fn update(&self, systems: &[GpuMassAssemblySystem]) -> Result<(), GpuArticulatedMassError> {
         if !self.has_layout(systems) {
@@ -475,7 +533,12 @@ impl GpuArticulatedMassAssemblyBatch {
             inverse.scratch.size(),
         );
         self.solver.encode(encoder);
-        let buffers = [&self.metadata, &inverse.scratch, &inverse.output];
+        let buffers = [
+            &self.metadata,
+            &inverse.scratch,
+            &inverse.output,
+            &self.prescribed,
+        ];
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Tessera articulated inverse mass bindings"),
             layout: &inverse.pipeline.get_bind_group_layout(0),
@@ -503,6 +566,7 @@ impl GpuArticulatedMassAssemblyBatch {
             &self.links,
             &self.vectors,
             self.solver.augmented_buffer(),
+            &self.prescribed,
         ];
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Tessera articulated mass assembly bindings"),

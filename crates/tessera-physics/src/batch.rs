@@ -749,6 +749,7 @@ mod tests {
             .set_joint_motor(
                 0,
                 Some(JointMotor {
+                    model: crate::articulated_world::MotorModel::ForceBased,
                     position_target: Some(target),
                     velocity_target: 0.0,
                     stiffness: 3.0,

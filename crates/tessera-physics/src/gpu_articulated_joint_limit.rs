@@ -10,11 +10,12 @@ use crate::gpu_articulated_state::GpuGeneralizedStateBatch;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PackedLimit {
+pub(crate) struct PackedLimit {
     lower: f32,
     upper: f32,
     max_speed: f32,
     flags: f32,
+    compliance: [f32; 4],
 }
 
 /// Invalid joint-bound layout or exhausted GPU capacity.
@@ -30,18 +31,23 @@ pub enum GpuArticulatedJointLimitError {
 
 /// Integrates generalized state and enforces CPU-compatible joint bounds.
 ///
-/// The velocity cap applies before the position update. A position that crosses
-/// a hard bound is clamped and its velocity is set to zero. This matches the
+/// The velocity cap applies before the position update. By default, a position
+/// that crosses a hard bound is clamped and its velocity is set to zero. This matches the
 /// fixed-root post-solve rule of `ArticulatedWorld::finish_contact_step`.
 /// The position integration mask is captured at construction. Disabled slots
 /// retain their position and bypass position bounds, while speed caps still apply.
 /// Set the state's mask before constructing this batch; reset retains that mask.
 /// Encode after the mass solve instead of `GpuGeneralizedStateBatch::encode_step`.
+/// Positive CFM replaces the clamp with coupled unilateral impulse rows and
+/// requires `GpuArticulatedMassAssemblyBatch::encode_with_inverse`.
 #[derive(Debug)]
 pub struct GpuArticulatedJointLimitBatch {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    compliant_pipeline: wgpu::ComputePipeline,
+    compliant_systems: wgpu::Buffer,
+    inverse: wgpu::Buffer,
     positions: wgpu::Buffer,
     position_integration: wgpu::Buffer,
     velocities: wgpu::Buffer,
@@ -54,9 +60,26 @@ pub struct GpuArticulatedJointLimitBatch {
     packed: Vec<PackedLimit>,
     dimensions: Vec<usize>,
     root_dofs: Vec<usize>,
+    dt: f32,
 }
 
 impl GpuArticulatedJointLimitBatch {
+    pub(crate) fn reset_parameters(&self) -> &[PackedLimit] {
+        &self.packed
+    }
+
+    pub(crate) fn parameter_buffer(&self) -> &wgpu::Buffer {
+        &self.limits
+    }
+
+    pub(crate) fn restore_reset_parameters(
+        &mut self,
+        destination: core::ops::Range<usize>,
+        parameters: &[PackedLimit],
+    ) {
+        self.packed[destination].copy_from_slice(parameters);
+    }
+
     /// Bind static coordinate bounds and optional speed caps to matching batches.
     pub fn new(
         state: &GpuGeneralizedStateBatch,
@@ -124,6 +147,7 @@ impl GpuArticulatedJointLimitBatch {
                     upper: 0.0,
                     max_speed: 0.0,
                     flags: 0.0,
+                    compliance: [0.2, 0.0, 0.0, 0.0],
                 },
                 root_dof,
             ));
@@ -147,7 +171,9 @@ impl GpuArticulatedJointLimitBatch {
         let limits_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera articulated joint limits"),
             contents: bytemuck::cast_slice(&packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
         let timestep = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tessera joint limit timestep"),
@@ -168,10 +194,45 @@ impl GpuArticulatedJointLimitBatch {
             compilation_options: Default::default(),
             cache: None,
         });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Tessera compliant articulated stops"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("gpu_articulated_joint_limit_compliance.wgsl").into(),
+            ),
+        });
+        let compliant_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Tessera compliant articulated stops"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("solve_stops"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let systems = state
+            .ranges()
+            .iter()
+            .zip(mass.inverse_ranges())
+            .map(|(coordinates, inverse)| {
+                [
+                    coordinates.start as u32,
+                    coordinates.len() as u32,
+                    inverse.start as u32,
+                    (inverse.end - 1) as u32,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let compliant_systems = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tessera compliant stop systems"),
+            contents: bytemuck::cast_slice(&systems),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         Ok(Self {
             device: device.clone(),
             queue: state.queue().clone(),
             pipeline,
+            compliant_pipeline,
+            compliant_systems,
+            inverse: mass.inverse_buffer_or_init().clone(),
             positions: state.position_buffer().clone(),
             position_integration: state.position_integration_buffer().clone(),
             velocities: state.velocity_buffer().clone(),
@@ -184,6 +245,7 @@ impl GpuArticulatedJointLimitBatch {
             packed,
             dimensions,
             root_dofs,
+            dt,
         })
     }
 
@@ -261,8 +323,123 @@ impl GpuArticulatedJointLimitBatch {
         Ok(())
     }
 
-    /// Encode bounded state integration after mass assembly and solve.
+    /// Replace compliance per coordinate, atomically across the whole batch.
+    ///
+    /// Floating-root and unbounded slots must retain zero CFM. Before stepping
+    /// soft stops, the owner must encode mass assembly with its inverse.
+    pub fn update_coordinate_compliance(
+        &mut self,
+        compliance: &[Vec<crate::gpu_contact_policy::GpuConstraintCompliance>],
+    ) -> Result<(), GpuArticulatedJointLimitError> {
+        if compliance.len() != self.dimensions.len() {
+            return Err(GpuArticulatedJointLimitError::InvalidInput);
+        }
+        let mut updated = self.packed.clone();
+        let mut offset = 0;
+        for ((values, &dimension), &root_dofs) in
+            compliance.iter().zip(&self.dimensions).zip(&self.root_dofs)
+        {
+            if values.len() != dimension {
+                return Err(GpuArticulatedJointLimitError::InvalidInput);
+            }
+            for (slot, (entry, value)) in updated[offset..offset + dimension]
+                .iter_mut()
+                .zip(values)
+                .enumerate()
+            {
+                if !value.is_valid()
+                    || !(value.cfm / self.dt).is_finite()
+                    || (value.cfm > 0.0
+                        && (slot < root_dofs || !(entry.flags == 1.0 || entry.flags == 3.0)))
+                {
+                    return Err(GpuArticulatedJointLimitError::InvalidInput);
+                }
+                entry.compliance = [value.erp, value.cfm, 0.0, entry.compliance[3]];
+            }
+            offset += dimension;
+        }
+        self.queue
+            .write_buffer(&self.limits, 0, bytemuck::cast_slice(&updated));
+        self.packed = updated;
+        Ok(())
+    }
+
+    /// Exclude prescribed slots from speed caps, hard clamps, and soft stops.
+    /// Positions still integrate with the retained prescribed velocity.
+    pub fn set_prescribed_coordinates(
+        &mut self,
+        selected: &[Vec<bool>],
+    ) -> Result<(), GpuArticulatedJointLimitError> {
+        if selected.len() != self.dimensions.len()
+            || selected
+                .iter()
+                .zip(&self.dimensions)
+                .any(|(mask, &n)| mask.len() != n)
+        {
+            return Err(GpuArticulatedJointLimitError::InvalidInput);
+        }
+        for (entry, &selected) in self.packed.iter_mut().zip(selected.iter().flatten()) {
+            entry.compliance[3] = if selected { 1.0 } else { 0.0 };
+        }
+        self.queue
+            .write_buffer(&self.limits, 0, bytemuck::cast_slice(&self.packed));
+        Ok(())
+    }
+
+    /// Solve soft stops, then integrate state, retaining legacy hard bounds.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_compliant_solve(encoder);
+        self.encode_integration(encoder);
+    }
+
+    /// Whether the owner must assemble an inverse mass matrix for soft stops.
+    pub fn has_compliant_limits(&self) -> bool {
+        self.packed.iter().any(|limit| limit.compliance[1] > 0.0)
+    }
+
+    /// Encode coupled compliant stop rows after mass assembly with inverse.
+    ///
+    /// Owners may place the contact solve between this pass and integration.
+    /// Call once per substep; this pass cold-starts impulses and accumulates
+    /// them across eight sequential sweeps. Hard stops remain integration clamps.
+    pub fn encode_compliant_solve(&self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.has_compliant_limits() {
+            return;
+        }
+        let buffers = [
+            &self.positions,
+            &self.velocities,
+            &self.accelerations,
+            &self.inverse,
+            &self.compliant_systems,
+            &self.state_status,
+            &self.limits,
+            &self.timestep,
+            &self.position_integration,
+        ];
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Tessera compliant stop bindings"),
+            layout: &self.compliant_pipeline.get_bind_group_layout(0),
+            entries: &buffers
+                .iter()
+                .enumerate()
+                .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect::<Vec<_>>(),
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Tessera compliant stops"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.compliant_pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(self.dimensions.len() as u32, 1, 1);
+    }
+
+    /// Integrate after contact and stop impulses without solving stops again.
+    pub fn encode_integration(&self, encoder: &mut wgpu::CommandEncoder) {
         let buffers = [
             &self.positions,
             &self.velocities,
@@ -321,6 +498,7 @@ fn pack_limits(
                 max_speed: cap.unwrap_or(0.0),
                 flags: if bounds.is_some() { 1.0 } else { 0.0 }
                     + if cap.is_some() { 2.0 } else { 0.0 },
+                compliance: [0.2, 0.0, 0.0, 0.0],
             });
         }
     }
@@ -628,6 +806,7 @@ mod tests {
                 stiffness: 20.0,
                 damping: 0.0,
                 max_force: 1.0,
+                model: Default::default(),
             }),
             ..Default::default()
         };

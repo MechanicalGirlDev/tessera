@@ -10,7 +10,7 @@ use nalgebra::{Isometry3, Matrix3, Translation3, UnitQuaternion, Vector3};
 
 use crate::articulated_world::{
     ArticulatedWorld, ArticulatedWorldError, ArticulatedWorldParams, JointPassive, LinkBox,
-    LinkConvex, LinkCylinder, LinkSphere,
+    LinkConvex, LinkCylinder, LinkSphere, LinkTriangleMesh,
 };
 use crate::articulation::{Articulation, ArticulationError, JointKind, JointSpec, LinkSpec};
 #[cfg(test)]
@@ -23,6 +23,22 @@ pub use crate::mesh::ConvexMeshResolver as UrdfMeshResolver;
 /// Options applied while constructing a Tessera world from URDF.
 #[derive(Debug, Clone)]
 pub struct UrdfLoadOptions {
+    /// Uniform length scale. Imported masses and inertia tensors are unchanged.
+    pub scale: f64,
+    /// World-space transform left-multiplied onto `root_pose` after scaling.
+    pub shift: Isometry3<f64>,
+    /// Import URDF inertials. Otherwise use zero mass, COM, and inertia,
+    /// matching the reference loader's zero-density colliders.
+    pub apply_imported_mass_props: bool,
+    /// Create colliders from URDF collision elements.
+    pub create_colliders_from_collision_shapes: bool,
+    /// Also create colliders from URDF visual elements.
+    pub create_colliders_from_visual_shapes: bool,
+    /// Enable collisions across joints while preserving explicit exclusions.
+    pub enable_joint_collisions: bool,
+    /// Resolve meshes as convex parts, or indexed surfaces when false.
+    /// Defaults to true to preserve existing native resolver callers.
+    pub convex_hull: bool,
     /// World transform of the URDF root link.
     pub root_pose: Isometry3<f64>,
     /// Whether the root link contributes six floating-base coordinates.
@@ -34,6 +50,13 @@ pub struct UrdfLoadOptions {
 impl Default for UrdfLoadOptions {
     fn default() -> Self {
         Self {
+            scale: 1.0,
+            shift: Isometry3::identity(),
+            apply_imported_mass_props: true,
+            create_colliders_from_collision_shapes: true,
+            create_colliders_from_visual_shapes: false,
+            enable_joint_collisions: false,
+            convex_hull: true,
             root_pose: Isometry3::identity(),
             floating_base: false,
             world: ArticulatedWorldParams::default(),
@@ -44,6 +67,12 @@ impl Default for UrdfLoadOptions {
 /// Stable metadata for one loaded URDF joint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UrdfJointInfo {
+    /// Original URDF joint name, before compound-joint expansion.
+    pub source_name: String,
+    /// Original kind, retaining continuous, planar, and floating distinctions.
+    pub source_kind: urdf_rs::JointType,
+    /// Original parent and child link indices, before virtual-frame expansion.
+    pub source_links: [usize; 2],
     /// Joint name from the URDF document.
     pub name: String,
     /// Parent link index in [`LoadedUrdf::link_names`].
@@ -76,6 +105,8 @@ pub struct UrdfMimicInfo {
 /// A loaded URDF model and its ready-to-step Tessera world.
 #[derive(Debug)]
 pub struct LoadedUrdf {
+    /// Policies actually used to construct this world.
+    pub options: UrdfLoadOptions,
     /// Robot name from the root `robot` element.
     pub robot_name: String,
     /// Link names in articulation index order. Compound joints and multiple
@@ -86,6 +117,30 @@ pub struct LoadedUrdf {
     pub joints: Vec<UrdfJointInfo>,
     /// Constructed fixed-root or floating-root physics world.
     pub world: ArticulatedWorld,
+}
+
+impl LoadedUrdf {
+    /// Find a named link, including generated virtual frames.
+    pub fn link_index(&self, name: &str) -> Option<usize> {
+        self.link_names
+            .iter()
+            .position(|candidate| candidate == name)
+    }
+
+    /// Find a joint component by its stable name.
+    pub fn joint(&self, name: &str) -> Option<&UrdfJointInfo> {
+        self.joints.iter().find(|joint| joint.name == name)
+    }
+
+    /// Iterate all components of one original URDF joint.
+    pub fn joint_components<'a>(
+        &'a self,
+        source_name: &'a str,
+    ) -> impl Iterator<Item = &'a UrdfJointInfo> + 'a {
+        self.joints
+            .iter()
+            .filter(move |joint| joint.source_name == source_name)
+    }
 }
 
 /// URDF parsing or model-conversion failure.
@@ -135,6 +190,22 @@ fn load_urdf_inner(
     options: UrdfLoadOptions,
     mut resolver: Option<&mut dyn ConvexMeshResolver>,
 ) -> Result<LoadedUrdf, UrdfLoadError> {
+    validate_positive(options.scale, "global scale")?;
+    for (name, transform) in [("root pose", &options.root_pose), ("shift", &options.shift)] {
+        if transform
+            .translation
+            .vector
+            .iter()
+            .chain(transform.rotation.coords.iter())
+            .any(|value| !value.is_finite())
+            || (transform.rotation.quaternion().norm_squared() - 1.0).abs() > 1e-8
+        {
+            return Err(UrdfLoadError::Invalid(format!(
+                "{name} must be a finite rigid transform"
+            )));
+        }
+    }
+    let applied_options = options.clone();
     let robot =
         urdf_rs::read_from_string(xml).map_err(|error| UrdfLoadError::Xml(error.to_string()))?;
     if robot.links.is_empty() {
@@ -157,8 +228,20 @@ fn load_urdf_inner(
     let mut links = robot
         .links
         .iter()
-        .map(link_spec)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|link| {
+            if options.apply_imported_mass_props {
+                let mut spec = link_spec(link)?;
+                spec.center_of_mass *= options.scale;
+                Ok(spec)
+            } else {
+                Ok(LinkSpec {
+                    mass: 0.0,
+                    center_of_mass: Vector3::zeros(),
+                    inertia: Matrix3::zeros(),
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, UrdfLoadError>>()?;
     let mut link_names = robot
         .links
         .iter()
@@ -189,7 +272,14 @@ fn load_urdf_inner(
                 joint.child.link
             )));
         }
-        let components = joint_components(joint)?;
+        let mut components = joint_components(joint)?;
+        for component in &mut components {
+            if component.kind == JointKind::Prismatic {
+                component.limits = component
+                    .limits
+                    .map(|(lower, upper)| (lower * options.scale, upper * options.scale));
+            }
+        }
         let damping = joint.dynamics.as_ref().map_or(0.0, |value| value.damping);
         let friction = joint.dynamics.as_ref().map_or(0.0, |value| value.friction);
         if !damping.is_finite() || damping < 0.0 {
@@ -215,7 +305,12 @@ fn load_urdf_inner(
         let mimic = joint.mimic.as_ref().map(|mimic| UrdfMimicInfo {
             source_joint: mimic.joint.clone(),
             multiplier: mimic.multiplier.unwrap_or(1.0),
-            offset: mimic.offset.unwrap_or(0.0),
+            offset: mimic.offset.unwrap_or(0.0)
+                * if joint.joint_type == urdf_rs::JointType::Prismatic {
+                    options.scale
+                } else {
+                    1.0
+                },
         });
         if let Some(relation) = &mimic {
             if !scalar || !relation.multiplier.is_finite() || !relation.offset.is_finite() {
@@ -253,7 +348,7 @@ fn load_urdf_inner(
                 parent: chain_parent,
                 child: chain_child,
                 origin: if index == 0 {
-                    pose(&joint.origin)
+                    scaled_pose(&joint.origin, options.scale)
                 } else {
                     Isometry3::identity()
                 },
@@ -262,6 +357,9 @@ fn load_urdf_inner(
                 limits: component.limits,
             });
             joint_info.push(UrdfJointInfo {
+                source_name: joint.name.clone(),
+                source_kind: joint.joint_type.clone(),
+                source_links: [parent, child],
                 name: component.suffix.map_or_else(
                     || joint.name.clone(),
                     |suffix| format!("{}/{suffix}", joint.name),
@@ -318,6 +416,14 @@ fn load_urdf_inner(
         root
     };
     let mut articulation = Articulation::new(links, joints, root)?;
+    // A compound joint's physical endpoints are still adjacent, even though
+    // translation helpers separate them in the articulation graph.
+    for joint in &robot.joints {
+        articulation.exclude_collision_pair(
+            link_indices[&joint.parent.link],
+            link_indices[&joint.child.link],
+        )?;
+    }
     let mimic_edges = mimic_requests
         .iter()
         .map(|(dependent, relation)| {
@@ -347,20 +453,33 @@ fn load_urdf_inner(
     let mut boxes = Vec::new();
     let mut cylinders = Vec::new();
     let mut convex_shapes = Vec::new();
+    let mut triangle_meshes = Vec::new();
     for (link_index, link) in robot.links.iter().enumerate() {
-        for collision in &link.collision {
-            let origin = pose(&collision.origin);
-            match &collision.geometry {
+        let geometries = link
+            .collision
+            .iter()
+            .filter(|_| options.create_colliders_from_collision_shapes)
+            .map(|shape| (&shape.origin, &shape.geometry))
+            .chain(
+                link.visual
+                    .iter()
+                    .filter(|_| options.create_colliders_from_visual_shapes)
+                    .map(|shape| (&shape.origin, &shape.geometry)),
+            );
+        for (local_pose, geometry) in geometries {
+            let origin = scaled_pose(local_pose, options.scale);
+            match geometry {
                 urdf_rs::Geometry::Sphere { radius } => {
                     validate_positive(*radius, "sphere radius")?;
                     spheres.push(LinkSphere {
                         link: link_index,
                         center: origin.translation.vector,
-                        radius: *radius,
+                        radius: *radius * options.scale,
                     });
                 }
                 urdf_rs::Geometry::Box { size } => {
-                    let half_extents = Vector3::new(size[0], size[1], size[2]) * 0.5;
+                    let half_extents =
+                        Vector3::new(size[0], size[1], size[2]) * (0.5 * options.scale);
                     if half_extents
                         .iter()
                         .any(|value| !value.is_finite() || *value <= 0.0)
@@ -381,20 +500,20 @@ fn load_urdf_inner(
                     cylinders.push(LinkCylinder {
                         link: link_index,
                         origin,
-                        half_height: length * 0.5,
-                        radius: *radius,
+                        half_height: length * 0.5 * options.scale,
+                        radius: *radius * options.scale,
                     });
                 }
                 urdf_rs::Geometry::Capsule { radius, length } => {
                     validate_positive(*radius, "capsule radius")?;
                     validate_nonnegative(*length, "capsule length")?;
-                    let half_height = length * 0.5;
+                    let half_height = length * 0.5 * options.scale;
                     if half_height > 0.0 {
                         cylinders.push(LinkCylinder {
                             link: link_index,
                             origin,
                             half_height,
-                            radius: *radius,
+                            radius: *radius * options.scale,
                         });
                     }
                     let endpoints: &[f64] = if half_height > 0.0 {
@@ -408,12 +527,15 @@ fn load_urdf_inner(
                             center: origin
                                 .transform_point(&nalgebra::Point3::new(0.0, 0.0, z))
                                 .coords,
-                            radius: *radius,
+                            radius: *radius * options.scale,
                         });
                     }
                 }
                 urdf_rs::Geometry::Mesh { filename, scale } => {
-                    let scale = scale.as_ref().map_or([1.0; 3], |value| value.0);
+                    let scale = scale
+                        .as_ref()
+                        .map_or([1.0; 3], |value| value.0)
+                        .map(|value| value * options.scale);
                     if scale
                         .iter()
                         .any(|value| !value.is_finite() || *value == 0.0)
@@ -427,6 +549,28 @@ fn load_urdf_inner(
                             "mesh `{filename}` requires a mesh resolver"
                         ))
                     })?;
+                    if !options.convex_hull {
+                        let parts =
+                            resolver
+                                .resolve_indexed(filename, scale)
+                                .map_err(|message| UrdfLoadError::Mesh {
+                                    filename: filename.clone(),
+                                    message,
+                                })?;
+                        if parts.is_empty() {
+                            return Err(UrdfLoadError::Invalid(format!(
+                                "mesh `{filename}` resolved to no indexed surfaces"
+                            )));
+                        }
+                        triangle_meshes.extend(parts.into_iter().map(|geometry| {
+                            LinkTriangleMesh {
+                                link: link_index,
+                                origin,
+                                geometry,
+                            }
+                        }));
+                        continue;
+                    }
                     let parts = resolver.resolve(filename, scale).map_err(|message| {
                         UrdfLoadError::Mesh {
                             filename: filename.clone(),
@@ -448,11 +592,13 @@ fn load_urdf_inner(
         }
     }
 
+    let root_pose = options.shift * options.root_pose;
     let mut world = if options.floating_base {
-        ArticulatedWorld::new_floating(articulation, options.root_pose, spheres, options.world)?
+        ArticulatedWorld::new_floating(articulation, root_pose, spheres, options.world)?
     } else {
-        ArticulatedWorld::new(articulation, options.root_pose, spheres, options.world)?
+        ArticulatedWorld::new(articulation, root_pose, spheres, options.world)?
     };
+    world.set_joint_contacts_enabled(options.enable_joint_collisions);
     let mut generalized_damping = vec![0.0; world.articulation.dof()];
     let mut generalized_friction = vec![0.0; world.articulation.dof()];
     for (edge, damping) in joint_dampings.into_iter().enumerate() {
@@ -478,13 +624,21 @@ fn load_urdf_inner(
     world.set_boxes(boxes)?;
     world.set_cylinders(cylinders)?;
     world.set_convex_shapes(convex_shapes)?;
+    world.set_triangle_meshes(triangle_meshes)?;
 
     Ok(LoadedUrdf {
+        options: applied_options,
         robot_name: robot.name,
         link_names,
         joints: joint_info,
         world,
     })
+}
+
+fn scaled_pose(origin: &urdf_rs::Pose, scale: f64) -> Isometry3<f64> {
+    let mut transform = pose(origin);
+    transform.translation.vector *= scale;
+    transform
 }
 
 fn link_index(

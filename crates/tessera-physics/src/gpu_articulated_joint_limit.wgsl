@@ -3,6 +3,7 @@ struct JointLimit {
     upper: f32,
     max_speed: f32,
     flags: f32,
+    compliance: vec4<f32>,
 };
 
 struct StepParams {
@@ -28,12 +29,13 @@ fn advance_limited(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if (mass_status[system] != 0u || atomicLoad(&state_status[system]) != 0u) { return; }
     let dt = params.timestep.x;
     let limit = limits[coordinate];
-    var velocity = velocities[coordinate] + accelerations[coordinate] * dt;
+    let prescribed = limit.compliance.w != 0.0;
+    var velocity = velocities[coordinate] + select(accelerations[coordinate] * dt, 0.0, prescribed);
     if (!(abs(velocity) < 1e30)) {
         atomicOr(&state_status[system], 1u);
         return;
     }
-    if (limit.flags >= 2.0) {
+    if (!prescribed && limit.flags >= 2.0) {
         velocity = clamp(velocity, -limit.max_speed, limit.max_speed);
     }
     let integrate_position = position_integration[coordinate] != 0u;
@@ -43,7 +45,8 @@ fn advance_limited(@builtin(global_invocation_id) invocation: vec3<u32>) {
         atomicOr(&state_status[system], 1u);
         return;
     }
-    if (integrate_position && (limit.flags == 1.0 || limit.flags == 3.0)) {
+    if (!prescribed && integrate_position && limit.compliance.y == 0.0
+        && (limit.flags == 1.0 || limit.flags == 3.0)) {
         let bounded = clamp(position, limit.lower, limit.upper);
         if (bounded != position) {
             velocity = 0.0;

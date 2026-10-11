@@ -12,6 +12,7 @@ struct Meta {
 @group(0) @binding(0) var<storage, read> systems: array<Meta>;
 @group(0) @binding(1) var<storage, read_write> augmented: array<f32>;
 @group(0) @binding(2) var<storage, read_write> inverse: array<f32>;
+@group(0) @binding(3) var<storage, read> prescribed: array<u32>;
 
 @compute @workgroup_size(64)
 fn invert(@builtin(global_invocation_id) invocation: vec3<u32>) {
@@ -88,6 +89,12 @@ fn invert(@builtin(global_invocation_id) invocation: vec3<u32>) {
         }
     }
     for (var element = 0u; element < n * n; element = element + 1u) {
+        let offset = descriptor.vector_offset / 2u;
+        if (prescribed[offset + element / n] != 0u
+            || prescribed[offset + element % n] != 0u) {
+            // Remove the solve-only placeholder response before any contact uses it.
+            inverse[output + element] = 0.0;
+        }
         if (!(abs(inverse[output + element]) < 1.0e30)) {
             return;
         }

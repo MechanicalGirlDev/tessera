@@ -3,6 +3,8 @@ use super::*;
 /// Stateless actuator dynamics supported by the reference MJCF converter.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MjcfActuatorKind {
+    /// Retained definition with no native drive implementation.
+    Unsupported,
     /// Constant generalized force multiplied by gear.
     Motor,
     /// Scalar coordinate servo; gear does not rescale the reference servo.
@@ -33,17 +35,23 @@ pub enum MjcfActuatorKind {
     },
 }
 
-/// One actuator resolved to a scalar native coordinate.
+/// One actuator definition, including definitions without a native drive.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MjcfActuatorInfo {
     /// Explicit or generated actuator name.
     pub name: String,
     /// Referenced MJCF joint name.
     pub joint: String,
-    /// Generalized coordinate, not actuator-control index.
-    pub coordinate: usize,
-    /// Supported dynamics.
+    /// Generalized coordinate when the transmission resolves to a scalar joint.
+    pub coordinate: Option<usize>,
+    /// Native dynamics; unsupported definitions never produce efforts.
     pub kind: MjcfActuatorKind,
+    /// Original XML element kind.
+    pub source_kind: String,
+    /// Default-resolved XML attributes, including transmission and activation metadata.
+    pub attributes: BTreeMap<String, String>,
+    /// Why this definition remains undriven; absent for supported definitions.
+    pub unsupported_reason: Option<String>,
     /// Scalar motor transmission gear.
     pub gear: f64,
     /// Enabled control clamp.
@@ -85,28 +93,23 @@ impl MjcfActuators {
     pub fn efforts(&self, world: &ArticulatedWorld) -> Result<Vec<f64>, MjcfLoadError> {
         let mut efforts = vec![0.0; world.positions.len()];
         for (a, &control) in self.entries.iter().zip(&self.controls) {
+            if a.kind == MjcfActuatorKind::Unsupported {
+                continue;
+            }
+            let coordinate = a.coordinate.ok_or_else(|| {
+                MjcfLoadError::Invalid("supported actuator has no coordinate".into())
+            })?;
             let u = a
                 .control_range
                 .map_or(control, |r| control.clamp(r[0], r[1]));
-            let q = *world
-                .positions
-                .as_slice()
-                .get(a.coordinate)
-                .ok_or_else(|| {
-                    MjcfLoadError::Invalid(
-                        "actuator coordinate is not present in this world".into(),
-                    )
-                })?;
-            let v = *world
-                .velocities
-                .as_slice()
-                .get(a.coordinate)
-                .ok_or_else(|| {
-                    MjcfLoadError::Invalid(
-                        "actuator coordinate is not present in this world".into(),
-                    )
-                })?;
+            let q = *world.positions.as_slice().get(coordinate).ok_or_else(|| {
+                MjcfLoadError::Invalid("actuator coordinate is not present in this world".into())
+            })?;
+            let v = *world.velocities.as_slice().get(coordinate).ok_or_else(|| {
+                MjcfLoadError::Invalid("actuator coordinate is not present in this world".into())
+            })?;
             let force = match a.kind {
+                MjcfActuatorKind::Unsupported => unreachable!(),
                 MjcfActuatorKind::Motor => u * a.gear,
                 MjcfActuatorKind::Position { kp, kv } => kp * (u - q) - kv * v,
                 MjcfActuatorKind::Velocity { kv } => kv * (u - v),
@@ -122,7 +125,7 @@ impl MjcfActuators {
             if !force.is_finite() {
                 return Err(MjcfLoadError::Invalid("nonfinite actuator force".into()));
             }
-            efforts[a.coordinate] += a.force_range.map_or(force, |r| force.clamp(r[0], r[1]));
+            efforts[coordinate] += a.force_range.map_or(force, |r| force.clamp(r[0], r[1]));
         }
         if efforts.iter().any(|v| !v.is_finite()) {
             return Err(MjcfLoadError::Invalid(

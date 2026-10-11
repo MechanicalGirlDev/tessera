@@ -166,9 +166,9 @@ pub fn convex_sphere_contact(
         .max_by(|a, b| a.dot(&best_normal).total_cmp(&b.dot(&best_normal)))?;
     let sphere_witness = center - best_normal * radius;
     let witness_midpoint = (*hull_witness + sphere_witness) * 0.5;
-    let center_midpoint = (hull_center + center) * 0.5;
+    // Preserve spherical tangents so a normal impulse cannot spin the sphere.
     let point =
-        center_midpoint + best_normal * (witness_midpoint - center_midpoint).dot(&best_normal);
+        sphere_witness + best_normal * (witness_midpoint - sphere_witness).dot(&best_normal);
     Some(ConvexContact {
         point,
         normal: best_normal,
@@ -1640,6 +1640,11 @@ mod tests {
         assert!(
             convex_sphere_contact(&vertices, &normals, Vector3::new(2.0, 0.0, 0.0), 0.4).is_none()
         );
+        let center = Vector3::new(0.8, 0.2, -0.15);
+        let offset = convex_sphere_contact(&vertices, &normals, center, 0.4).unwrap();
+        assert!((offset.point - center).cross(&offset.normal).norm() < 1e-12);
+        assert!((offset.point.y - center.y).abs() < 1e-12);
+        assert!((offset.point.z - center.z).abs() < 1e-12);
     }
 
     #[test]

@@ -1,10 +1,13 @@
 //! Spherical-joint drives in the parent-side joint tangent frame.
 
+use crate::articulated_world::MotorModel;
 use nalgebra::{UnitQuaternion, Vector3};
 
 /// Quaternion position and angular-velocity drive with per-axis effort limits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SphericalJointDrive {
+    /// Whether gains produce physical torque or angular acceleration.
+    pub model: MotorModel,
     /// Desired child orientation relative to the parent-side joint frame.
     pub orientation_target: UnitQuaternion<f64>,
     /// Desired relative angular velocity in the parent-side joint frame.
@@ -13,7 +16,7 @@ pub struct SphericalJointDrive {
     pub stiffness: Vector3<f64>,
     /// Nonnegative derivative gains along the joint frame axes.
     pub damping: Vector3<f64>,
-    /// Nonnegative component-wise torque caps in the joint frame.
+    /// Nonnegative physical torque caps in the joint frame; positive infinity is unbounded.
     pub max_torque: Vector3<f64>,
 }
 
@@ -32,16 +35,44 @@ impl SphericalJointDrive {
         orientation: UnitQuaternion<f64>,
         angular_velocity: Vector3<f64>,
     ) -> Result<Vector3<f64>, SphericalJointDriveError> {
+        if self.model != MotorModel::ForceBased {
+            return Err(SphericalJointDriveError);
+        }
+        self.torque_with_inverse_mass(orientation, angular_velocity, Vector3::zeros())
+    }
+
+    /// Compute physical torque using each tangent axis's `J M^-1 J^T`.
+    /// For an articulation, project the full native inverse mass matrix onto the
+    /// three parent-side joint tangent rows, including all coupled coordinates.
+    /// Each motor is normalized independently before applying physical caps.
+    pub fn torque_with_inverse_mass(
+        &self,
+        orientation: UnitQuaternion<f64>,
+        angular_velocity: Vector3<f64>,
+        inverse_mass: Vector3<f64>,
+    ) -> Result<Vector3<f64>, SphericalJointDriveError> {
         self.validate()?;
         validate_orientation(&orientation)?;
         if !angular_velocity.iter().all(|v| v.is_finite()) {
             return Err(SphericalJointDriveError);
         }
         let error = (self.orientation_target * orientation.inverse()).scaled_axis();
-        let torque = self.stiffness.component_mul(&error)
+        let mut torque = self.stiffness.component_mul(&error)
             + self
                 .damping
                 .component_mul(&(self.velocity_target - angular_velocity));
+        if self.model == MotorModel::AccelerationBased {
+            if inverse_mass.iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return Err(SphericalJointDriveError);
+            }
+            for axis in 0..3 {
+                torque[axis] = if inverse_mass[axis] == 0.0 {
+                    0.0
+                } else {
+                    torque[axis] / inverse_mass[axis]
+                };
+            }
+        }
         if !torque.iter().all(|v| v.is_finite()) {
             return Err(SphericalJointDriveError);
         }
@@ -54,9 +85,10 @@ impl SphericalJointDrive {
     pub fn validate(&self) -> Result<(), SphericalJointDriveError> {
         validate_orientation(&self.orientation_target)?;
         if !self.velocity_target.iter().all(|v| v.is_finite())
-            || [&self.stiffness, &self.damping, &self.max_torque]
+            || [&self.stiffness, &self.damping]
                 .iter()
                 .any(|values| values.iter().any(|v| !v.is_finite() || *v < 0.0))
+            || self.max_torque.iter().any(|v| v.is_nan() || *v < 0.0)
         {
             return Err(SphericalJointDriveError);
         }
@@ -107,6 +139,7 @@ mod tests {
         )
         .unwrap();
         let drive = SphericalJointDrive {
+            model: MotorModel::ForceBased,
             orientation_target: UnitQuaternion::from_scaled_axis(Vector3::y() * 1.8),
             velocity_target: Vector3::zeros(),
             stiffness: Vector3::repeat(10.0),
@@ -153,6 +186,7 @@ mod tests {
         let error = Vector3::new(0.2, -0.3, 0.1);
         let velocity = Vector3::new(0.4, -0.2, 0.7);
         let drive = SphericalJointDrive {
+            model: MotorModel::ForceBased,
             orientation_target: UnitQuaternion::from_scaled_axis(error) * current,
             velocity_target: Vector3::new(-0.2, 0.1, 0.3),
             stiffness: Vector3::new(10.0, 20.0, 30.0),
@@ -176,6 +210,8 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid = drive;
         invalid.max_torque.z = f64::INFINITY;
+        assert!(invalid.validate().is_ok());
+        invalid.max_torque.z = f64::NEG_INFINITY;
         assert!(invalid.validate().is_err());
         assert!(
             drive

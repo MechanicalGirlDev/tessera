@@ -72,6 +72,8 @@ pub mod gpu_kinematic_body;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_lbvh;
 #[cfg(feature = "gpu-contact")]
+pub mod gpu_mjcf_actuator;
+#[cfg(feature = "gpu-contact")]
 pub mod gpu_motor_target;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_point_query;
@@ -97,12 +99,15 @@ pub mod gpu_scene_dynamics;
 pub mod gpu_sphere_box_contact;
 #[cfg(feature = "gpu-contact")]
 pub mod gpu_sphere_contact;
+#[cfg(feature = "gpu-contact")]
+pub mod gpu_spherical_motor_target;
 pub mod inverse_kinematics;
 pub mod mass_properties;
 pub mod material;
 pub mod mesh;
 pub mod mjcf;
 pub mod point_query;
+pub mod prescribed_dof;
 pub mod ray_query;
 pub mod sleep;
 pub mod sphere_world;

@@ -76,7 +76,7 @@ use crate::gpu_motor_target::{
 use crate::spherical_drive::SphericalJointDrive;
 
 #[path = "gpu_dynamics_reset.rs"]
-mod resident_reset;
+pub(crate) mod resident_reset;
 pub use resident_reset::GpuArticulatedDynamicsResetTemplates;
 
 #[cfg(test)]
@@ -356,6 +356,9 @@ pub enum GpuArticulatedDynamicsError {
     /// Joint drive or implicit passive input failed.
     #[error(transparent)]
     JointForce(#[from] GpuArticulatedJointForceError),
+    /// Imported stateless actuator feedback metadata or controls failed.
+    #[error(transparent)]
+    MjcfActuator(#[from] crate::gpu_mjcf_actuator::GpuMjcfActuatorError),
     /// Hard position or velocity limit input failed.
     #[error(transparent)]
     JointLimit(#[from] GpuArticulatedJointLimitError),
@@ -377,6 +380,9 @@ pub enum GpuArticulatedDynamicsError {
     /// Quaternion drive construction or update failed.
     #[error(transparent)]
     SphericalDrive(#[from] GpuSphericalDriveError),
+    /// Resident spherical action mapping or capacity is invalid.
+    #[error(transparent)]
+    SphericalTargets(#[from] crate::gpu_spherical_motor_target::GpuSphericalMotorTargetError),
     /// Sleep coordinate ownership or GPU capacity is invalid.
     #[error(transparent)]
     SleepFreeze(#[from] GpuSleepFreezeError),
@@ -410,6 +416,9 @@ pub struct GpuArticulatedDynamicsOutput {
 /// passive correction and state integration.
 #[derive(Debug)]
 pub struct GpuArticulatedDynamicsBatch {
+    prescribed_coordinates: Vec<Vec<bool>>,
+    limit_compliance: Vec<Vec<crate::prescribed_dof::ConstraintCompliance>>,
+    contact_policy: std::sync::Mutex<crate::gpu_contact_policy::GpuContactPolicy>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     mass: GpuArticulatedMassAssemblyBatch,
@@ -417,6 +426,7 @@ pub struct GpuArticulatedDynamicsBatch {
     poses: GpuArticulatedPoseBatch,
     link_terms: GpuArticulatedLinkTermsBatch,
     joint_forces: GpuArticulatedJointForceBatch,
+    mjcf_actuators: Option<crate::gpu_mjcf_actuator::GpuMjcfActuatorBatch>,
     motor_targets: Option<GpuMotorTargetControl>,
     scalar_motor_links: Vec<Vec<(usize, usize)>>,
     accepted_joints: std::sync::Mutex<Vec<Vec<GpuJointForceInput>>>,
@@ -438,10 +448,135 @@ pub struct GpuArticulatedDynamicsBatch {
     root_dofs: Vec<usize>,
     spherical: Option<GpuArticulatedSphericalBatch>,
     spherical_drives: Option<GpuArticulatedSphericalDriveBatch>,
+    spherical_targets: Option<crate::gpu_spherical_motor_target::GpuSphericalMotorTargetControl>,
     accepted_spherical_drives: std::sync::Mutex<Vec<Vec<Option<SphericalJointDrive>>>>,
 }
 
 impl GpuArticulatedDynamicsBatch {
+    /// Map GPU actions to parent-joint rotation-vector or angular-velocity targets.
+    pub fn enable_spherical_motor_target_control(
+        &mut self,
+        mappings: &[Vec<crate::gpu_spherical_motor_target::GpuSphericalMotorTargetMapping>],
+        delays: &[u32],
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        let drives = self
+            .spherical_drives
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        let accepted = self
+            .accepted_spherical_drives
+            .lock()
+            .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+        let targets = crate::gpu_spherical_motor_target::GpuSphericalMotorTargetControl::new(
+            &self.device,
+            drives.parameter_buffer(),
+            &accepted,
+            mappings,
+            delays,
+        )?;
+        self.spherical_targets = Some(targets);
+        Ok(())
+    }
+
+    /// Latch environment-interleaved STORAGE f32 actions after a GPU producer.
+    pub fn encode_spherical_motor_targets(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        actions: &wgpu::Buffer,
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        let targets = self
+            .spherical_targets
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        if actions.size() != targets.action_bytes()
+            || !actions.usage().contains(wgpu::BufferUsages::STORAGE)
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        targets.encode_latch(&self.device, encoder, actions);
+        Ok(())
+    }
+
+    /// Replace per-environment GPU delay counts and restart pending countdowns.
+    pub fn encode_spherical_motor_target_delays(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        delays: &wgpu::Buffer,
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        let targets = self
+            .spherical_targets
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        if delays.size() != self.dimensions.len() as u64 * 4
+            || !delays.usage().contains(wgpu::BufferUsages::STORAGE)
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        targets.encode_delays(&self.device, encoder, delays);
+        Ok(())
+    }
+
+    /// Cancel all pending spherical actions without altering applied targets.
+    pub fn cancel_spherical_motor_targets(&self) -> Result<(), GpuArticulatedDynamicsError> {
+        self.spherical_targets
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
+            .cancel(&self.queue)?;
+        Ok(())
+    }
+
+    /// Configure imported stateless feedback against current resident q/dq.
+    ///
+    /// Prefixes identify each robot's first reduced joint coordinate, allowing
+    /// floating roots and composed scene bodies in the same packed owner.
+    pub fn enable_mjcf_actuators(
+        &mut self,
+        actuators: &[crate::mjcf::MjcfActuators],
+        joint_prefixes: &[usize],
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        if actuators.len() != self.dimensions.len() || joint_prefixes.len() != actuators.len() {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let inputs = self
+            .state
+            .ranges()
+            .iter()
+            .zip(actuators)
+            .zip(joint_prefixes)
+            .map(|((coordinates, actuators), &joint_prefix)| {
+                crate::gpu_mjcf_actuator::GpuMjcfActuatorInput {
+                    coordinates: coordinates.clone(),
+                    joint_prefix,
+                    entries: actuators.entries(),
+                    controls: actuators.controls(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let feedback = crate::gpu_mjcf_actuator::GpuMjcfActuatorBatch::new(
+            &self.device,
+            &self.queue,
+            self.state.position_buffer(),
+            self.state.velocity_buffer(),
+            self.forces.base_force_buffer(),
+            &inputs,
+        )?;
+        self.mjcf_actuators = Some(feedback);
+        Ok(())
+    }
+
+    /// Atomically upload held controls for one configured environment.
+    pub fn update_mjcf_controls(
+        &self,
+        environment: usize,
+        controls: &[f64],
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        self.mjcf_actuators
+            .as_ref()
+            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
+            .update_controls(environment, controls)?;
+        Ok(())
+    }
+
     /// Initialize prescribed external sphere motion before the first step.
     /// Works after any fixed, floating, or spherical batch constructor.
     /// Pair ordering matches the corresponding center update methods.
@@ -882,8 +1017,8 @@ impl GpuArticulatedDynamicsBatch {
             .collect::<Vec<_>>();
         let forces = GpuArticulatedForceBatch::new(&mass, &zero_forces, &gravities)?;
         forces.set_link_loads(&loads)?;
-        let joint_forces = GpuArticulatedJointForceBatch::new_implicit(
-            &state, &forces, &joints, &armatures, timestep,
+        let joint_forces = GpuArticulatedJointForceBatch::new_implicit_with_mass(
+            &state, &forces, &joints, &armatures, timestep, &mass,
         )?;
         let mut joint_limits = GpuArticulatedJointLimitBatch::new_with_floating_roots(
             &state,
@@ -914,9 +1049,11 @@ impl GpuArticulatedDynamicsBatch {
             joint_limits.update_coordinate_velocity_limits(&caps)?;
         }
         let spherical_drives = match (&spherical, spherical_drive_input) {
-            (Some(spherical), Some(drives)) => Some(GpuArticulatedSphericalDriveBatch::new(
-                &state, spherical, &forces, drives,
-            )?),
+            (Some(spherical), Some(drives)) => {
+                Some(GpuArticulatedSphericalDriveBatch::new_with_mass(
+                    &state, spherical, &forces, drives, &mass,
+                )?)
+            }
             _ => None,
         };
         let velocity_bias = if let Some(spherical) = &spherical {
@@ -1149,6 +1286,17 @@ impl GpuArticulatedDynamicsBatch {
                 })
                 .collect(),
             coordinate_owners,
+            prescribed_coordinates: dimensions.iter().map(|&n| vec![false; n]).collect(),
+            limit_compliance: dimensions
+                .iter()
+                .zip(&root_dofs)
+                .map(|(&n, &root)| {
+                    vec![crate::prescribed_dof::ConstraintCompliance::default(); n - root]
+                })
+                .collect(),
+            contact_policy: std::sync::Mutex::new(
+                crate::gpu_contact_policy::GpuContactPolicy::default(),
+            ),
             sleep_freeze: None,
             actuation_efforts: None,
             topology_mobility,
@@ -1159,6 +1307,7 @@ impl GpuArticulatedDynamicsBatch {
             poses,
             link_terms,
             joint_forces,
+            mjcf_actuators: None,
             accepted_joints: std::sync::Mutex::new(
                 inputs.iter().map(|input| input.joints.clone()).collect(),
             ),
@@ -1176,6 +1325,7 @@ impl GpuArticulatedDynamicsBatch {
             root_dofs,
             spherical,
             spherical_drives,
+            spherical_targets: None,
             accepted_spherical_drives: std::sync::Mutex::new(
                 spherical_drive_input.map_or_else(Vec::new, <[_]>::to_vec),
             ),
@@ -1689,16 +1839,29 @@ impl GpuArticulatedDynamicsBatch {
     pub fn build_contact_sleep_freeze(
         &self,
     ) -> Result<GpuArticulatedSleepFreezeBatch, GpuArticulatedDynamicsError> {
+        self.build_contact_sleep_freeze_with_selection(&self.prescribed_coordinates)
+    }
+
+    fn build_contact_sleep_freeze_with_selection(
+        &self,
+        selected: &[Vec<bool>],
+    ) -> Result<GpuArticulatedSleepFreezeBatch, GpuArticulatedDynamicsError> {
         let contact = self
             .ground_contact
             .as_ref()
             .ok_or(GpuArticulatedDynamicsError::InvalidInput)?;
+        let mut owners = self.coordinate_owners.clone();
+        for (owner, &prescribed) in owners.iter_mut().flatten().zip(selected.iter().flatten()) {
+            if prescribed {
+                owner.clear();
+            }
+        }
         Ok(GpuArticulatedSleepFreezeBatch::new(
             &self.state,
             &self.mass,
             contact.contact_sleep_candidate_buffer()?,
             self.poses.link_ranges(),
-            &self.coordinate_owners,
+            &owners,
         )?)
     }
 
@@ -1723,9 +1886,17 @@ impl GpuArticulatedDynamicsBatch {
         if let Some(targets) = &self.motor_targets {
             targets.encode_apply(&self.device, encoder);
         }
+        if let Some(targets) = &self.spherical_targets {
+            targets.encode_apply(&self.device, encoder);
+        }
         self.poses.encode(encoder);
         self.link_terms.encode(encoder);
+        self.joint_forces.encode_prepare_mass(encoder);
+        self.mass.encode_with_inverse(encoder);
         self.joint_forces.encode(encoder);
+        if let Some(actuators) = &self.mjcf_actuators {
+            actuators.encode(encoder);
+        }
         if let Some(drives) = &self.spherical_drives {
             drives.encode(encoder);
         }
@@ -1741,15 +1912,18 @@ impl GpuArticulatedDynamicsBatch {
         }
         self.velocity_bias.encode(encoder);
         self.forces.encode(encoder);
-        if let Some(contact) = &self.ground_contact {
+        if self.ground_contact.is_some() || self.joint_limits.has_compliant_limits() {
             self.mass.encode_with_inverse(encoder);
+        } else {
+            self.mass.encode(encoder);
+        }
+        self.joint_limits.encode_compliant_solve(encoder);
+        if let Some(contact) = &self.ground_contact {
             if let (Some(bounds), Some(lbvh)) = (&self.shape_bounds, &self.lbvh) {
                 let candidates = bounds.encode_candidates(&self.device, encoder, lbvh)?;
                 contact.encode_dynamic_shape_rows(encoder, lbvh, &candidates)?;
             }
             contact.encode(encoder);
-        } else {
-            self.mass.encode(encoder);
         }
         Ok(())
     }
@@ -1763,7 +1937,7 @@ impl GpuArticulatedDynamicsBatch {
         if let Some(freeze) = &self.sleep_freeze {
             freeze.encode(encoder);
         }
-        self.joint_limits.encode(encoder);
+        self.joint_limits.encode_integration(encoder);
         if let Some(spherical) = &self.spherical {
             spherical.encode(encoder);
         }
@@ -1793,6 +1967,130 @@ impl GpuArticulatedDynamicsBatch {
     /// Fixed integration timestep in seconds.
     pub fn timestep(&self) -> f64 {
         self.timestep
+    }
+
+    /// Selected constant-velocity coordinates per environment, including root prefixes.
+    pub fn prescribed_coordinates(&self) -> &[Vec<bool>] {
+        &self.prescribed_coordinates
+    }
+
+    /// Select prescribed motion without zeroing velocity used by bias or integration.
+    ///
+    /// This changes the dynamic principal mass solve, contact response, scalar
+    /// clamps and the owned sleep-freeze pass together. Previously exported
+    /// standalone freeze passes must be rebuilt after changing this selection.
+    pub fn set_prescribed_coordinates(
+        &mut self,
+        selected: &[Vec<bool>],
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        if selected.len() != self.dimensions.len()
+            || selected
+                .iter()
+                .zip(&self.dimensions)
+                .any(|(mask, &n)| mask.len() != n)
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let freeze = if self.sleep_freeze.is_some() {
+            Some(self.build_contact_sleep_freeze_with_selection(selected)?)
+        } else {
+            None
+        };
+        self.mass.set_prescribed_coordinates(selected)?;
+        self.joint_limits.set_prescribed_coordinates(selected)?;
+        self.prescribed_coordinates = selected.to_vec();
+        self.sleep_freeze = freeze;
+        if let Some(contact) = &self.ground_contact {
+            let policy = *self
+                .contact_policy
+                .lock()
+                .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+            contact.update_contact_policy(&self.queue, policy)?;
+        }
+        self.clear_sleep_diagnostics();
+        Ok(())
+    }
+
+    /// Per-environment scalar stop compliance, excluding floating-root prefixes.
+    pub fn joint_limit_compliance(&self) -> &[Vec<crate::prescribed_dof::ConstraintCompliance>] {
+        &self.limit_compliance
+    }
+
+    /// Replace scalar stop policies with the same joint-only layout as CPU worlds.
+    pub fn set_joint_limit_compliance(
+        &mut self,
+        values: &[Vec<crate::prescribed_dof::ConstraintCompliance>],
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        if values.len() != self.dimensions.len() {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let mut packed = Vec::with_capacity(values.len());
+        for ((values, &n), &root) in values.iter().zip(&self.dimensions).zip(&self.root_dofs) {
+            if values.len() != n - root || values.iter().any(|value| !value.is_valid()) {
+                return Err(GpuArticulatedDynamicsError::InvalidInput);
+            }
+            let mut entries =
+                vec![crate::gpu_contact_policy::GpuConstraintCompliance::default(); root];
+            for value in values {
+                entries.push(
+                    value
+                        .gpu()
+                        .ok_or(GpuArticulatedDynamicsError::InvalidInput)?,
+                );
+            }
+            packed.push(entries);
+        }
+        self.joint_limits.update_coordinate_compliance(&packed)?;
+        self.limit_compliance = values.to_vec();
+        Ok(())
+    }
+
+    /// Configure independent native normal, coupling, point-loop and fixed-loop rows.
+    pub fn set_constraint_policy(
+        &self,
+        policy: crate::prescribed_dof::ArticulatedConstraintPolicy,
+    ) -> Result<(), GpuArticulatedDynamicsError> {
+        if !policy.is_valid() {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let mut packed = *self
+            .contact_policy
+            .lock()
+            .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+        packed.position_gain = 0.2;
+        let convert = |value: crate::prescribed_dof::ConstraintCompliance| {
+            value.gpu().ok_or(GpuArticulatedDynamicsError::InvalidInput)
+        };
+        packed.dynamic_normal = convert(policy.dynamic_contact)?;
+        packed.static_normal = convert(policy.fixed_contact)?;
+        packed.coupling_constraint = convert(policy.coupling)?;
+        packed.loop_constraint = convert(policy.point_loop)?;
+        packed.fixed_loop_constraint = convert(policy.fixed_loop)?;
+        self.update_contact_policy(packed)
+    }
+
+    /// Current native contact policy; GPU values are returned at resident precision.
+    pub fn constraint_policy(
+        &self,
+    ) -> Result<crate::prescribed_dof::ArticulatedConstraintPolicy, GpuArticulatedDynamicsError>
+    {
+        let policy = self
+            .contact_policy
+            .lock()
+            .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+        let convert = |value: crate::gpu_contact_policy::GpuConstraintCompliance| {
+            crate::prescribed_dof::ConstraintCompliance {
+                erp: f64::from(value.erp),
+                cfm: f64::from(value.cfm),
+            }
+        };
+        Ok(crate::prescribed_dof::ArticulatedConstraintPolicy {
+            dynamic_contact: convert(policy.dynamic_normal),
+            fixed_contact: convert(policy.static_normal),
+            coupling: convert(policy.coupling_constraint),
+            point_loop: convert(policy.loop_constraint),
+            fixed_loop: convert(policy.fixed_loop_constraint),
+        })
     }
 
     /// Configure resident scalar motor targets with one equally sized mapping per environment.
@@ -2009,6 +2307,13 @@ impl GpuArticulatedDynamicsBatch {
             .accepted_spherical_drives
             .lock()
             .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+        if self
+            .spherical_targets
+            .as_ref()
+            .is_some_and(|targets| !targets.accepts_inputs(drives))
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
         self.spherical_drives
             .as_ref()
             .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
@@ -2787,11 +3092,28 @@ impl GpuArticulatedDynamicsBatch {
         &self,
         policy: crate::gpu_contact_policy::GpuContactPolicy,
     ) -> Result<(), GpuArticulatedDynamicsError> {
-        Ok(self
-            .ground_contact
-            .as_ref()
-            .ok_or(GpuArticulatedDynamicsError::InvalidInput)?
-            .update_contact_policy(&self.queue, policy)?)
+        if policy.packed().is_none()
+            || [
+                policy.dynamic_normal,
+                policy.static_normal,
+                policy.loop_constraint,
+                policy.fixed_loop_constraint,
+                policy.coupling_constraint,
+            ]
+            .iter()
+            .any(|value| !(f64::from(value.cfm) / self.timestep).is_finite())
+        {
+            return Err(GpuArticulatedDynamicsError::InvalidInput);
+        }
+        let mut accepted = self
+            .contact_policy
+            .lock()
+            .map_err(|_| GpuArticulatedDynamicsError::InvalidInput)?;
+        if let Some(contact) = &self.ground_contact {
+            contact.update_contact_policy(&self.queue, policy)?;
+        }
+        *accepted = policy;
+        Ok(())
     }
 
     /// Download solved-impulse activity per environment and stable link index.
@@ -4194,6 +4516,7 @@ mod tests {
             assert!(flags.iter().all(|v| *v == 0));
             batch.enable_contact_sleep(&[Some(idle_settings)]).unwrap();
             let zero_drive = SphericalJointDrive {
+                model: crate::articulated_world::MotorModel::ForceBased,
                 orientation_target: nalgebra::UnitQuaternion::identity(),
                 velocity_target: Vector3::zeros(),
                 stiffness: Vector3::zeros(),
@@ -4264,6 +4587,7 @@ mod tests {
         let flags = [false, true];
         let q0 = UnitQuaternion::from_scaled_axis(Vector3::y() * 1.4);
         let drive = SphericalJointDrive {
+            model: crate::articulated_world::MotorModel::ForceBased,
             orientation_target: UnitQuaternion::from_scaled_axis(Vector3::y() * 1.8),
             velocity_target: Vector3::zeros(),
             stiffness: Vector3::repeat(2.0),
@@ -4502,7 +4826,11 @@ mod tests {
                         .angle()
                         < 1e-12
                 );
-                assert!(world.step(0.001, &[0.0; 3]).is_err());
+                let workspace = world.positions.clone();
+                world.step(0.001, &[0.0; 3]).unwrap();
+                assert_eq!(world.positions, workspace);
+                let advanced = world.gpu_spherical_state().unwrap()[0].orientation;
+                assert!((prior.inverse() * advanced).angle() > 1e-4);
             }
             let mut bad = inputs
                 .iter()
@@ -5005,6 +5333,7 @@ mod tests {
                             damping_cubic: 0.05,
                         },
                         motor: Some(JointMotor {
+                            model: crate::articulated_world::MotorModel::ForceBased,
                             position_target: Some(0.0),
                             velocity_target: 0.2,
                             stiffness: 3.0,
@@ -5431,6 +5760,7 @@ mod tests {
             assert_eq!(batch.readback_sleeping_coordinates().unwrap(), [vec![true]]);
             let mut changed = input.joints.clone();
             changed[0].motor = Some(JointMotor {
+                model: crate::articulated_world::MotorModel::ForceBased,
                 position_target: Some(1.0),
                 velocity_target: 0.0,
                 stiffness: 0.0,

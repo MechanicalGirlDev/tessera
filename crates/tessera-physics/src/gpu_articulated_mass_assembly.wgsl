@@ -13,6 +13,9 @@ struct Meta {
 @group(0) @binding(1) var<storage, read> links: array<f32>;
 @group(0) @binding(2) var<storage, read> vectors: array<f32>;
 @group(0) @binding(3) var<storage, read_write> augmented: array<f32>;
+@group(0) @binding(4) var<storage, read> prescribed: array<u32>;
+
+var<workgroup> prescribed_diagonal: f32;
 
 @compute @workgroup_size(64)
 fn assemble(
@@ -58,5 +61,31 @@ fn assemble(
             }
         }
         augmented[output] = value;
+    }
+    storageBarrier();
+    // Match the placeholder diagonal to the dynamic block's scale so excluded
+    // massless coordinates do not make a well-conditioned dynamic block singular.
+    if (lane == 0u) {
+        var scale = 0.0;
+        for (var row = 0u; row < n; row++) {
+            if (prescribed[descriptor.vector_offset / 2u + row] == 0u) {
+                scale = max(scale, abs(augmented[descriptor.matrix_offset + row * row_stride + row]));
+            }
+        }
+        prescribed_diagonal = select(1.0, scale, scale > 0.0);
+    }
+    workgroupBarrier();
+    for (var element = lane; element < n * row_stride; element += 64u) {
+        let row = element / row_stride;
+        let col = element % row_stride;
+        let offset = descriptor.vector_offset / 2u;
+        let row_prescribed = prescribed[offset + row] != 0u;
+        if (col == n) {
+            if (row_prescribed) { augmented[descriptor.matrix_offset + element] = 0.0; }
+        } else if (row_prescribed || prescribed[offset + col] != 0u) {
+            // Solve M_DD a_D = f_D with a_K = 0, not (M^-1 f)_D.
+            augmented[descriptor.matrix_offset + element] =
+                select(0.0, prescribed_diagonal, row == col);
+        }
     }
 }

@@ -91,7 +91,67 @@ pub struct GpuKinematicBodyBatch {
     count: u32,
 }
 
+#[derive(Debug)]
+pub(crate) struct GpuKinematicResetTemplates {
+    source: wgpu::Buffer,
+    bodies: wgpu::Buffer,
+    translation: wgpu::Buffer,
+    status: wgpu::Buffer,
+}
+
 impl GpuKinematicBodyBatch {
+    pub(crate) fn snapshot_reset_templates(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> GpuKinematicResetTemplates {
+        use crate::gpu_articulated_dynamics::resident_reset::snapshot_buffer;
+        GpuKinematicResetTemplates {
+            source: self.bodies.clone(),
+            bodies: snapshot_buffer(&self.device, encoder, &self.bodies),
+            translation: snapshot_buffer(&self.device, encoder, &self.translation),
+            status: snapshot_buffer(&self.device, encoder, &self.status),
+        }
+    }
+
+    pub(crate) fn matches_reset_templates(&self, templates: &GpuKinematicResetTemplates) -> bool {
+        self.bodies == templates.source
+    }
+
+    pub(crate) fn encode_reset_environments(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        templates: &GpuKinematicResetTemplates,
+        environments: &[usize],
+    ) {
+        for &environment in environments {
+            let range = &self.ranges[environment];
+            if range.is_empty() {
+                continue;
+            }
+            for (source, destination, stride) in [
+                (
+                    &templates.bodies,
+                    &self.bodies,
+                    size_of::<PackedBody>() as u64,
+                ),
+                (
+                    &templates.translation,
+                    &self.translation,
+                    size_of::<PackedKinematicTranslation>() as u64,
+                ),
+                (&templates.status, &self.status, 4),
+            ] {
+                encoder.copy_buffer_to_buffer(
+                    source,
+                    range.start as u64 * stride,
+                    destination,
+                    range.start as u64 * stride,
+                    range.len() as u64 * stride,
+                );
+            }
+        }
+    }
+
     /// Upload bodies in environment order with a fixed integration timestep.
     pub fn new(
         device: &wgpu::Device,
